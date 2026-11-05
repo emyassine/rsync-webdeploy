@@ -61,23 +61,25 @@ MPL-2.0
 
 ## Lite mode (no `jq`)
 
-Use `yas-webdeploy-lite` for a single SSH/rsync deployment with no JSON parser or other runtime utilities. It reads a plain text `KEY=value` profile and does not execute or source that file. Bash, `rsync`, and `ssh` are the only runtime requirements.
+Use `yas-webdeploy-lite` for a single SSH/rsync deployment with no JSON parser or other runtime utilities. It reads a plain text `KEY=value` profile and does not execute or source that file. Bash, `rsync`, and `ssh` are the runtime requirements. If `SSH_PASSWORD` is set, Lite uses OpenSSH askpass without requiring `jq` or `sshpass`.
 
-Earth & Sky example profile: [`earth_and_sky-web-sync.conf`](earth_and_sky-web-sync.conf). Copy it into the directory you want to deploy, or download it there from this repository. Example contents:
+Example `webdeploy.conf`:
 
 ```ini
-SERVER=145.223.39.21
-USER=u320478370
-SSH_PORT=65002
+SERVER=your-server.example
+USER=your-ssh-user
+SSH_PORT=22
 SOURCE=.
-DEST=/home/u320478370/domains/earthandskycorp.com/public_html
+DEST=/home/your-ssh-user/public_html
+SSH_PASSWORD=
 ```
+
+Leave `SSH_PASSWORD` empty when using SSH keys. When you set it, Lite uses OpenSSH askpass; the value is plain text in the config, so keep that file private and outside the source directory.
 
 Run it from the project directory:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main/earth_and_sky-web-sync.conf -o earth_and_sky-web-sync.conf
-yas-webdeploy-lite earth_and_sky-web-sync.conf
+yas-webdeploy-lite ~/.config/webdeploy.conf
 ```
 
-The source path is relative to the profile file. Lite mode excludes `.git`, `.env`, and `.env.*`. It does not delete remote files that are absent locally.
+The source path is relative to your current working directory. Lite mode applies no exclusions: it sends every file under the source directory as rsync sees it. It does not delete remote files that are absent locally. Keep the profile outside the source directory, especially when it contains `SSH_PASSWORD`.

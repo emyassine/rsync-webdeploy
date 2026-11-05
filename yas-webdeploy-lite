@@ -14,14 +14,13 @@ if (( $# > 1 )); then usage >&2; exit 2; fi
 config_file="${1:-$PWD/webdeploy.conf}"
 if [[ "$config_file" != /* ]]; then config_file="$PWD/$config_file"; fi
 [[ -f "$config_file" && -r "$config_file" ]] || fail "config file not found or unreadable: $config_file"
-config_dir="${config_file%/*}"
-config_dir="$(cd -- "$config_dir" && pwd -P)"
 
 server=''
 user=''
 ssh_port='22'
 source_path='.'
 dest=''
+ssh_password=''
 line_number=0
 while IFS= read -r line || [[ -n "$line" ]]; do
   line_number=$((line_number + 1))
@@ -36,6 +35,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     SSH_PORT) ssh_port=$value ;;
     SOURCE) source_path=$value ;;
     DEST) dest=$value ;;
+    SSH_PASSWORD) ssh_password=$value ;;
     *) fail "$config_file:$line_number: unknown key '$key'" ;;
   esac
 done < "$config_file"
@@ -49,22 +49,38 @@ done < "$config_file"
 if [[ "$source_path" == /* ]]; then
   source_dir=$source_path
 else
-  source_dir="$config_dir/$source_path"
+  source_dir="$PWD/$source_path"
 fi
 [[ -d "$source_dir" ]] || fail "source directory not found: $source_dir"
 command -v rsync >/dev/null 2>&1 || fail 'rsync is required on this machine'
 command -v ssh >/dev/null 2>&1 || fail 'ssh is required on this machine'
 
 host="$user@$server"
+ssh_options="-p $ssh_port -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+if [[ -n "$ssh_password" ]]; then
+  askpass_helper=$(mktemp "${TMPDIR:-/tmp}/yas-webdeploy-askpass.XXXXXX") || fail 'could not create SSH askpass helper'
+  cleanup_askpass() { rm -f -- "$askpass_helper"; }
+  trap cleanup_askpass EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cat > "$askpass_helper" <<'ASKPASS_EOF'
+#!/bin/sh
+printf '%s\n' "$YAS_WEBDEPLOY_SSH_PASSWORD"
+ASKPASS_EOF
+  chmod 700 "$askpass_helper" || fail 'could not secure SSH askpass helper'
+  export YAS_WEBDEPLOY_SSH_PASSWORD="$ssh_password"
+  export SSH_ASKPASS="$askpass_helper"
+  export SSH_ASKPASS_REQUIRE=force
+  export DISPLAY="${DISPLAY:-yas-webdeploy:0}"
+  ssh_options+=" -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+else
+  ssh_options+=" -o BatchMode=yes"
+fi
 printf 'Source:      %s\n' "$source_dir"
 printf 'Destination: %s:%s\n' "$host" "$dest"
 printf 'SSH port:    %s\n' "$ssh_port"
 printf '\nStarting rsync deployment...\n'
-rsync -az --human-readable --progress \
-  -e "ssh -p $ssh_port" \
-  --exclude='/.git/' \
-  --exclude='/.env' \
-  --exclude='/.env.*' \
-  --exclude="/${config_file##*/}" \
+rsync -az --human-readable --progress --timeout=30 \
+  -e "ssh $ssh_options" \
   "$source_dir/" "$host:$dest/"
 printf '\nDeployment completed.\n'
