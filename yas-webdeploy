@@ -26,7 +26,8 @@ set -euo pipefail
 
 CONFIG_FILE="${1:-$PWD/web-sync.config.json}"
 if [[ "$CONFIG_FILE" != /* ]]; then CONFIG_FILE="$PWD/$CONFIG_FILE"; fi
-CONFIG_DIR="$(cd -- "$(dirname -- "$CONFIG_FILE")" && pwd)"
+CONFIG_DIR="${CONFIG_FILE%/*}"
+CONFIG_DIR="$(cd -- "$CONFIG_DIR" && pwd -P)"
 GITIGNORE_FILE="$CONFIG_DIR/.gitignore"
 
 BASE_DEPENDENCIES=(jq)
@@ -168,6 +169,119 @@ run_post_deploy() {
       ;;
   esac
 }
+
+show_help() {
+  cat <<'HELP'
+Usage: yas-webdeploy [profile]
+
+Pass a .json profile for the full deployment workflow (requires jq), or a
+KEY=value profile for the simple SSH/rsync workflow (no jq required).
+KEY=value profiles support SOURCE=. for local files or SOURCE=user@host:/path
+for a remote source. Remote sources are relayed through this machine.
+HELP
+}
+
+run_key_value_profile() {
+  local server='' user='' ssh_port='22' source_path='.' dest=''
+  local ssh_password='' source_ssh_password='' source_ssh_port='22'
+  local line key value line_number=0 remote_source=false source_remote='' source_host=''
+  local relay_dir='' askpass_helper='' askpass_display="${DISPLAY:-yas-webdeploy:0}"
+  local dest_ssh="ssh -p 22" source_ssh='' host=''
+
+  fail_profile() { say_error "$*"; return 1; }
+  if [[ ! -f "$CONFIG_FILE" || ! -r "$CONFIG_FILE" ]]; then
+    fail_profile "Config file not found or unreadable: $CONFIG_FILE"
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_number=$((line_number + 1))
+    [[ -z "$line" ]] && continue
+    case "$line" in \#*) continue ;; esac
+    [[ "$line" == *=* ]] || { fail_profile "$CONFIG_FILE:$line_number: expected KEY=value"; return 1; }
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      SERVER) server=$value ;;
+      USER) user=$value ;;
+      SSH_PORT) ssh_port=$value ;;
+      SOURCE) source_path=$value ;;
+      DEST) dest=$value ;;
+      SSH_PASSWORD) ssh_password=$value ;;
+      SOURCE_SSH_PORT) source_ssh_port=$value ;;
+      SOURCE_SSH_PASSWORD) source_ssh_password=$value ;;
+      *) fail_profile "$CONFIG_FILE:$line_number: unknown key '$key'"; return 1 ;;
+    esac
+  done < "$CONFIG_FILE"
+
+  [[ -n "$server" && -n "$user" ]] || { fail_profile 'SERVER and USER are required'; return 1; }
+  [[ "$ssh_port" =~ ^[0-9]+$ ]] && (( ssh_port >= 1 && ssh_port <= 65535 )) || { fail_profile 'SSH_PORT must be from 1 to 65535'; return 1; }
+  [[ "$source_ssh_port" =~ ^[0-9]+$ ]] && (( source_ssh_port >= 1 && source_ssh_port <= 65535 )) || { fail_profile 'SOURCE_SSH_PORT must be from 1 to 65535'; return 1; }
+  [[ -n "$dest" && "$dest" == /* ]] || { fail_profile 'DEST must be an absolute remote path'; return 1; }
+
+  if [[ "$source_path" =~ ^[^/:]+@[^/:]+:.+ ]]; then
+    remote_source=true
+    source_remote="$source_path"
+    source_host=${source_path%%:*}
+    [[ "$source_remote" == */ ]] || source_remote+="/"
+  else
+    [[ "$source_path" == /* ]] || source_path="$PWD/$source_path"
+    [[ -d "$source_path" ]] || { fail_profile "Source directory not found: $source_path"; return 1; }
+  fi
+
+  check_dependencies ssh rsync || return 1
+  host="$user@$server"
+  dest_ssh="ssh -p $ssh_port -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+  source_ssh="ssh -p $source_ssh_port -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+  if [[ -z "$ssh_password" ]]; then dest_ssh+=" -o BatchMode=yes"; else dest_ssh+=" -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"; fi
+  if [[ -z "$source_ssh_password" ]]; then source_ssh+=" -o BatchMode=yes"; else source_ssh+=" -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"; fi
+
+  if [[ -n "$ssh_password" || ( "$remote_source" == true && -n "$source_ssh_password" ) ]]; then
+    check_dependencies mktemp chmod rm || return 1
+    askpass_helper=$(mktemp "${TMPDIR:-/tmp}/yas-webdeploy-askpass.XXXXXX") || { fail_profile 'Could not create SSH askpass helper'; return 1; }
+    printf '#!/bin/sh\nprintf "%%s\\n" "$YAS_WEBDEPLOY_ASKPASS_PASSWORD"\n' > "$askpass_helper"
+    chmod 700 "$askpass_helper" || { rm -f -- "$askpass_helper"; fail_profile 'Could not secure SSH askpass helper'; return 1; }
+  fi
+
+  cleanup_profile() {
+    [[ -z "$relay_dir" ]] || find "$relay_dir" -depth -delete
+    [[ -z "$askpass_helper" ]] || rm -f -- "$askpass_helper"
+  }
+  trap cleanup_profile EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  printf '\n%s%sYAS WEBDEPLOY%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  say_info "Target: $host:$dest"
+  say_info "SSH port: $ssh_port"
+  if [[ "$remote_source" == true ]]; then
+    say_info "Remote source: $source_remote"
+    say_info 'Relay: remote source -> this machine -> destination'
+    relay_dir=$(mktemp -d "${TMPDIR:-/tmp}/yas-webdeploy-relay.XXXXXX") || { fail_profile 'Could not create local relay directory'; return 1; }
+    say_step 'Downloading source to temporary local relay'
+    if [[ -n "$source_ssh_password" ]]; then
+      YAS_WEBDEPLOY_ASKPASS_PASSWORD="$source_ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" rsync -az --human-readable --progress --timeout=30 -e "$source_ssh" "$source_remote" "$relay_dir/"
+    else
+      rsync -az --human-readable --progress --timeout=30 -e "$source_ssh" "$source_remote" "$relay_dir/"
+    fi
+    source_path="$relay_dir/"
+  fi
+
+  say_step 'Uploading source to destination'
+  if [[ -n "$ssh_password" ]]; then
+    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" rsync -az --human-readable --progress --timeout=30 -e "$dest_ssh" "$source_path" "$host:$dest/"
+  else
+    rsync -az --human-readable --progress --timeout=30 -e "$dest_ssh" "$source_path" "$host:$dest/"
+  fi
+  say_success 'Deployment completed'
+}
+
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then show_help; exit 0; fi
+if (( $# > 1 )); then show_help >&2; exit 2; fi
+if [[ "${CONFIG_FILE##*.}" != json ]]; then
+  run_key_value_profile
+  exit $?
+fi
 
 ensure_config_file_is_in_gitignore
 [[ ! -f "$CONFIG_FILE" ]] && create_default_config

@@ -1,6 +1,6 @@
 # yas-webdeploy
 
-Deploy static sites and web applications to a remote web server over SSH with rsync. SFTP is available for basic transfers.
+Deploy a site with rsync over SSH. Run it from the source machine, or use a remote source profile to relay files through the machine running `yas-webdeploy` to the destination. JSON profiles retain the full multi-deployment workflow; simple `KEY=value` profiles need no `jq`.
 
 ## Install
 
@@ -8,78 +8,49 @@ Deploy static sites and web applications to a remote web server over SSH with rs
 curl -fsSL https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main/install.sh | sh
 ```
 
-The installer puts `yas-webdeploy` in `~/.local/bin` and adds that directory to the startup file for Bash or Zsh. Open a new terminal, or source the file reported by the installer.
+The installer puts one command, `yas-webdeploy`, in `~/.local/bin` and adds that directory to the startup file for Bash or Zsh.
 
-Requirements: Bash, `jq`, `ssh`, and `rsync` for SSH deployments. SFTP deployments require `sftp`.
+## Simple profile (no jq)
 
-## Configure
+Create a private `webdeploy.conf` outside the source directory:
 
-Create `web-sync.config.json` in the project directory, then run `yas-webdeploy`. To use a named profile, pass its path:
+```ini
+# Local source to remote destination
+SERVER=destination.example
+USER=deploy
+SSH_PORT=22
+SOURCE=/path/to/site
+DEST=/home/deploy/public_html
+SSH_PASSWORD=
+
+# For a remote source, use this instead of SOURCE=/path/to/site:
+# SOURCE=source-user@source.example:/home/source-user/site/
+# SOURCE_SSH_PORT=22
+# SOURCE_SSH_PASSWORD=
+```
+
+Run it with:
 
 ```sh
-yas-webdeploy earth_and_sky-web-sync.config.json
+yas-webdeploy ~/.config/webdeploy.conf
 ```
 
-Relative config and source paths are resolved from the config file's directory. Config files are added to that directory's `.gitignore` when the tool runs.
+`SOURCE` may be a local directory or `user@host:/path/` on another SSH server. For a remote source, the command downloads to a temporary directory on the machine running `yas-webdeploy`, then uploads to the destination. That machine needs enough temporary disk space for the source files and network access to both SSH servers. Temporary files are removed when the command exits.
 
-Example:
+`SSH_PASSWORD` is the destination SSH password. `SOURCE_SSH_PASSWORD` is used only for a remote source. Leave either empty to use SSH keys. Passwords are stored as plain text in the profile; keep it private. Connect to each SSH host once beforehand to accept its host key.
 
-```json
-{
-  "server": "example.com",
-  "user": "deploy",
-  "ssh_port": 22,
-  "method": "ssh",
-  "unsafe_mode": false,
-  "ssh_password": "",
-  "sudo_password": "",
-  "remote_chown": "",
-  "remote_dir_mode": "755",
-  "remote_file_mode": "644",
-  "remote_sudo": false,
-  "remote_staging_root": "/home/deploy/.web-sync-staging",
-  "deploys": {
-    "site": {
-      "enable": true,
-      "source": "public",
-      "dest": "/home/deploy/public_html",
-      "type": "static"
-    }
-  }
-}
+The simple profile uses Bash, `rsync`, and `ssh`; it does not use `jq` or apply file exclusions. It does not delete remote files that are absent from the source. Relative local `SOURCE` paths are resolved from the current directory.
+
+## JSON profile
+
+Use a JSON profile for multiple deployment targets, SFTP, Git ignore exclusions, remote permissions, and Laravel/WebKernel post-deploy steps. JSON mode requires `jq`; SSH transfers also require `ssh` and `rsync`.
+
+```sh
+yas-webdeploy web-sync.config.json
 ```
 
-`ssh_port` sets the SSH, rsync and SFTP port; it defaults to `22`. Supported deployment types are `static`, `laravel`, and `webkernel`. All enabled deployments run when invoked. Laravel and WebKernel deployments run the configured Composer and Artisan commands after transfer.
-
-SSH keys are recommended. Password fields are ignored unless `unsafe_mode` is enabled; stored passwords are plain text. Keep credentials out of version control.
+The JSON schema and configuration examples are documented in the project history. SSH and sudo password fields in JSON are used only when `unsafe_mode` is enabled.
 
 ## License
 
 MPL-2.0
-
-**El Moumen Yassine**
-
-## Lite mode (no `jq`)
-
-Use `yas-webdeploy-lite` for a single SSH/rsync deployment with no JSON parser or other runtime utilities. It reads a plain text `KEY=value` profile and does not execute or source that file. Bash, `rsync`, and `ssh` are the runtime requirements. If `SSH_PASSWORD` is set, Lite uses OpenSSH askpass without requiring `jq` or `sshpass`.
-
-Example `webdeploy.conf`:
-
-```ini
-SERVER=your-server.example
-USER=your-ssh-user
-SSH_PORT=22
-SOURCE=.
-DEST=/home/your-ssh-user/public_html
-SSH_PASSWORD=
-```
-
-Leave `SSH_PASSWORD` empty when using SSH keys. When you set it, Lite uses OpenSSH askpass; the value is plain text in the config, so keep that file private and outside the source directory.
-
-Run it from the project directory:
-
-```sh
-yas-webdeploy-lite ~/.config/webdeploy.conf
-```
-
-The source path is relative to your current working directory. Lite mode applies no exclusions: it sends every file under the source directory as rsync sees it. It does not delete remote files that are absent locally. Keep the profile outside the source directory, especially when it contains `SSH_PASSWORD`.
