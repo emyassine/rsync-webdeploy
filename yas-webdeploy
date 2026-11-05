@@ -1,5 +1,5 @@
 #!/bin/bash
-YAS_WEBDEPLOY_VERSION='2026.11.05-2'
+YAS_WEBDEPLOY_VERSION='2026.11.05-4'
 #
 # yas-webdeploy
 #
@@ -214,6 +214,7 @@ ND_OPERATION_LOG=''
 ND_OPERATION_NAME=''
 ND_OPERATION_START=0
 ND_OPERATION_START_UTC=''
+ND_SYNC_START_SECONDS=0
 
 operation_start() {
   ND_OPERATION_NAME=$1
@@ -248,7 +249,7 @@ cleanup_no_delay() {
 
 overall_progress_line() {
   local done_bytes=$1 total_bytes=$2 phase=$3 file_index=$4 file_count=$5
-  local width=28 percent=0 filled blank_bar fill_bar rest_bar
+  local width=28 percent=0 filled blank_bar fill_bar rest_bar elapsed eta eta_text
   (( total_bytes > 0 )) && percent=$((done_bytes * 100 / total_bytes))
   (( percent > 100 )) && percent=100
   filled=$((percent * width / 100))
@@ -257,10 +258,16 @@ overall_progress_line() {
   rest_bar=${blank_bar:filled}
   fill_bar=${fill_bar// /#}
   rest_bar=${rest_bar// /-}
+  eta_text='ETA --'
+  elapsed=$((SECONDS - ND_SYNC_START_SECONDS))
+  if (( done_bytes > 0 && done_bytes < total_bytes && elapsed > 0 )); then
+    eta=$(((total_bytes - done_bytes) * elapsed / done_bytes))
+    eta_text=$(printf 'ETA %02d:%02d:%02d' "$((eta / 3600))" "$((eta % 3600 / 60))" "$((eta % 60))")
+  fi
   if [[ -t 1 ]]; then
-    printf '\r\033[K[%s%s] %3d%% %-8s file %d/%d' "$fill_bar" "$rest_bar" "$percent" "$phase" "$file_index" "$file_count"
+    printf '\r\033[K[%s%s] %3d%% %-8s file %d/%d %s' "$fill_bar" "$rest_bar" "$percent" "$phase" "$file_index" "$file_count" "$eta_text"
   else
-    printf '[%s%s] %3d%% %-8s file %d/%d\n' "$fill_bar" "$rest_bar" "$percent" "$phase" "$file_index" "$file_count"
+    printf '[%s%s] %3d%% %-8s file %d/%d %s\n' "$fill_bar" "$rest_bar" "$percent" "$phase" "$file_index" "$file_count" "$eta_text"
   fi
 }
 
@@ -326,6 +333,8 @@ run_sync_without_delay() {
   local fetch_batch_bytes=0 remote_mkdir_command parent_dir candidate_dir known
   local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=()
   local -a dest_directories=()
+
+  ND_SYNC_START_SECONDS=$SECONDS
 
   check_dependencies ssh rsync find mktemp cksum mkdir mv chmod unlink || return 1
   [[ "$source_path" =~ ^[^/:]+@[^/:]+:.+ ]] && source_kind=remote || source_kind=local
@@ -400,12 +409,19 @@ run_sync_without_delay() {
   # First try a destination-side pull. It needs destination-to-source SSH key access.
   printf -v source_remote_q '%q' "$source_remote"
   printf -v dest_path_q '%q' "$dest/"
-  local direct_probe direct_source_ssh
+  local direct_probe direct_source_ssh direct_probe_status direct_probe_output direct_probe_log direct_reason direct_choice
   printf -v direct_probe_source_q '%q' "$source_endpoint"
   direct_source_ssh="ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6"
-  direct_probe="command -v rsync >/dev/null 2>&1 && ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6 $direct_probe_source_q true"
-  say_step 'Checking whether destination can pull directly from source'
-  if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_probe" >/dev/null 2>&1; then
+  direct_probe="command -v rsync >/dev/null 2>&1 || { echo YAS_DEST_RSYNC_MISSING; exit 20; }; ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6 $direct_probe_source_q 'command -v rsync >/dev/null 2>&1 || { echo YAS_SOURCE_RSYNC_MISSING; exit 21; }'"
+  direct_probe_log="$relay_state/direct-pull-probe.log"
+  operation_start 'Probe destination-to-source pull'
+  if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_probe" > "$direct_probe_log" 2>&1; then
+    direct_probe_status=0
+  else
+    direct_probe_status=$?
+  fi
+  operation_finish 0
+  if (( direct_probe_status == 0 )); then
     printf -v direct_source_q '%q' "$source_remote"
     direct_command="rsync -az --no-owner --no-group --partial --append-verify --info=progress2 --no-inc-recursive --stats --timeout=30 -e '$direct_source_ssh' $direct_source_q $dest_path_q"
     say_step 'Direct source-to-destination transfer (overall progress)'
@@ -416,7 +432,38 @@ run_sync_without_delay() {
     fi
     say_warn 'Direct transfer stopped; continuing through the local relay and resuming completed files'
   else
-    say_info 'Destination cannot pull from source; relaying files through this machine'
+    direct_probe_output=$(<"$direct_probe_log")
+    direct_reason='destination-to-source SSH or rsync check failed'
+    case "$direct_probe_output" in
+      *YAS_DEST_RSYNC_MISSING*) direct_reason='rsync is not installed on the destination' ;;
+      *YAS_SOURCE_RSYNC_MISSING*) direct_reason='rsync is not installed on the source' ;;
+      *'Permission denied'*) direct_reason='the destination has no SSH key authorized on the source; the source password configured on this machine is not forwarded to the destination' ;;
+      *'Connection timed out'*|*'Operation timed out'*) direct_reason='the destination cannot reach the source SSH port (routing or firewall timeout)' ;;
+      *'Connection refused'*) direct_reason='the source refused SSH connections on the configured port' ;;
+      *'Could not resolve hostname'*|*'Name or service not known'*) direct_reason='the destination could not resolve the source hostname' ;;
+    esac
+    say_warn "Direct pull unavailable: $direct_reason"
+    say_info 'SFTP from this machine to the destination only proves this machine can upload. Direct pull requires the destination itself to reach the source over SSH and run rsync.'
+    say_info "Probe output is saved in $direct_probe_log"
+    say_info 'Choices: 1) relay through this machine now; this machine downloads then uploads the source, using twice the source traffic and local disk for the current batch; 2) stop and configure destination-to-source SSH key access plus rsync at both ends; 3) cancel.'
+    if [[ -t 0 ]]; then
+      printf 'Choose [1/2/3] (default 1): '
+      IFS= read -r direct_choice || direct_choice=1
+      direct_choice=${direct_choice:-1}
+    else
+      direct_choice=1
+    fi
+    case "$direct_choice" in
+      1) say_info 'Continuing with the resumable local relay' ;;
+      2)
+        say_info 'From the destination, install or confirm rsync, create an SSH key if needed, and authorize its public key in the source account authorized_keys file.'
+        say_info 'Then, from the destination, verify: ssh -p <source-port> <source-user>@<source-host> "command -v rsync"'
+        say_info 'Rerun yas-webdeploy after that check succeeds.'
+        return 2
+        ;;
+      3) say_info 'Cancelled before transferring files'; return 1 ;;
+      *) say_error 'Choose 1, 2, or 3'; return 2 ;;
+    esac
   fi
 
   # NUL-delimited metadata preserves arbitrary path characters, including tabs and newlines.
