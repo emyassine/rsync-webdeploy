@@ -205,6 +205,17 @@ ND_PROGRESS_FILE=0
 ND_PROGRESS_FILES=0
 ND_PROGRESS_FILE_BYTES=0
 
+parse_inventory_record() {
+  local record=$1 remainder
+  [[ "$record" == *$'\t'* ]] || return 1
+  file_size=${record%%$'\t'*}
+  remainder=${record#*$'\t'}
+  [[ "$remainder" == *$'\t'* ]] || return 1
+  file_mtime=${remainder%%$'\t'*}
+  relative_path=${remainder#*$'\t'}
+  [[ "$file_size" =~ ^[0-9]+$ && -n "$file_mtime" && -n "$relative_path" ]]
+}
+
 cleanup_no_delay() {
   if [[ -n "$ND_SOURCE_SOCKET" && -n "$ND_SOURCE_ENDPOINT" ]]; then
     ssh -S "$ND_SOURCE_SOCKET" -O exit -p "$ND_SOURCE_PORT" "$ND_SOURCE_ENDPOINT" >/dev/null 2>&1 || true
@@ -292,7 +303,7 @@ run_sync_without_delay() {
   local source_kind direct_command source_remote_q dest_path_q source_path_q remote_parent_q remote_command
   local file_size file_mtime relative_path file_id marker signature local_file parent_path
   local total_files=0 total_bytes=0 fetched_bytes=0 sent_bytes=0 fetched_files=0 sent_files=0
-  local current_index=0 inventory_path source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
+  local current_index=0 inventory_path inventory_line source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
   local fetch_batch_bytes=0 remote_mkdir_command parent_dir candidate_dir known
   local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=()
   local -a dest_directories=()
@@ -390,8 +401,9 @@ run_sync_without_delay() {
   fi
   say_step 'Scanning source inventory'
   ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "$source_find_command" > "$inventory_path" || { say_error 'Could not list source files'; return 1; }
-  while IFS=$'\t' read -r file_size file_mtime relative_path; do
-    [[ -z "$file_size" ]] && continue
+  while IFS= read -r inventory_line; do
+    [[ -z "$inventory_line" ]] && continue
+    parse_inventory_record "$inventory_line" || { say_error 'Invalid source inventory record; refusing to use malformed file metadata'; return 1; }
     total_files=$((total_files + 1))
     total_bytes=$((total_bytes + file_size))
   done < "$inventory_path"
@@ -494,8 +506,9 @@ run_sync_without_delay() {
     batch_start_index=0
   }
 
-  while IFS=$'\t' read -r file_size file_mtime relative_path; do
-    [[ -z "$file_size" ]] && continue
+  while IFS= read -r inventory_line; do
+    [[ -z "$inventory_line" ]] && continue
+    parse_inventory_record "$inventory_line" || { say_error 'Invalid source inventory record; refusing to use malformed file metadata'; return 1; }
     current_index=$((current_index + 1))
     file_id=$(printf '%s' "$relative_path" | cksum)
     file_id=${file_id%% *}
@@ -551,7 +564,9 @@ run_key_value_profile() {
   fi
 
   if [[ "${CONFIG_FILE##*.}" == json ]]; then
-    local deployment_count source_kind source_host source_user source_path_json
+    local schema_version deployment_count source_kind source_host source_user source_path_json
+    schema_version=$(jq -r '.schema_version // empty' "$CONFIG_FILE")
+    [[ "$schema_version" == 1 ]] || { fail_profile "Unsupported or missing schema_version '$schema_version' (expected 1)"; return 1; }
     deployment_count=$(jq '[.deployments[] | select(.enabled != false)] | length' "$CONFIG_FILE")
     [[ "$deployment_count" == 1 ]] || { fail_profile 'Nested JSON profiles currently require exactly one enabled deployment'; return 1; }
     server=$(jq -r '.destination.server.host // empty' "$CONFIG_FILE")
