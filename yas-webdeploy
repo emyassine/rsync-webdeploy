@@ -204,16 +204,27 @@ ND_PROGRESS_PHASE=''
 ND_PROGRESS_FILE=0
 ND_PROGRESS_FILES=0
 ND_PROGRESS_FILE_BYTES=0
+ND_OPERATION_LOG=''
+ND_OPERATION_NAME=''
+ND_OPERATION_START=0
+ND_OPERATION_START_UTC=''
 
-parse_inventory_record() {
-  local record=$1 remainder
-  [[ "$record" == *$'\t'* ]] || return 1
-  file_size=${record%%$'\t'*}
-  remainder=${record#*$'\t'}
-  [[ "$remainder" == *$'\t'* ]] || return 1
-  file_mtime=${remainder%%$'\t'*}
-  relative_path=${remainder#*$'\t'}
-  [[ "$file_size" =~ ^[0-9]+$ && -n "$file_mtime" && -n "$relative_path" ]]
+operation_start() {
+  ND_OPERATION_NAME=$1
+  ND_OPERATION_START=$SECONDS
+  ND_OPERATION_START_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  printf '%s\tSTART\t0\trunning\t%s\n' "$ND_OPERATION_START_UTC" "$ND_OPERATION_NAME" >> "$ND_OPERATION_LOG"
+  say_step "$ND_OPERATION_NAME"
+}
+
+operation_finish() {
+  local status=$1 ended_utc duration result
+  ended_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  duration=$((SECONDS - ND_OPERATION_START))
+  result=completed
+  [[ "$status" == 0 ]] || result=failed
+  printf '%s\tEND\t%d\t%s\t%s\n' "$ended_utc" "$duration" "$result" "$ND_OPERATION_NAME" >> "$ND_OPERATION_LOG"
+  if [[ "$status" == 0 ]]; then say_success "$ND_OPERATION_NAME completed in ${duration}s"; else say_error "$ND_OPERATION_NAME failed after ${duration}s"; fi
 }
 
 cleanup_no_delay() {
@@ -285,14 +296,16 @@ run_metered_rsync() {
 
 open_ssh_master() {
   local endpoint=$1 port=$2 socket=$3 password=$4 label=$5
+  local status
   local -a options=(-M -N -f -S "$socket" -o ControlMaster=yes -o ControlPersist=24h -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -p "$port")
-  say_step "Checking $label connection"
+  operation_start "Check $label connection"
   if [[ -n "$password" ]]; then
-    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$password" SSH_ASKPASS="$ND_ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-yas-webdeploy:0}" ssh "${options[@]}" "$endpoint"
+    if YAS_WEBDEPLOY_ASKPASS_PASSWORD="$password" SSH_ASKPASS="$ND_ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-yas-webdeploy:0}" ssh "${options[@]}" "$endpoint"; then status=0; else status=$?; fi
   else
-    ssh "${options[@]}" -o BatchMode=yes "$endpoint"
+    if ssh "${options[@]}" -o BatchMode=yes "$endpoint"; then status=0; else status=$?; fi
   fi
-  say_success "$label connection is ready"
+  operation_finish "$status"
+  return "$status"
 }
 
 run_sync_without_delay() {
@@ -303,7 +316,7 @@ run_sync_without_delay() {
   local source_kind direct_command source_remote_q dest_path_q source_path_q remote_parent_q remote_command
   local file_size file_mtime relative_path file_id marker signature local_file parent_path
   local total_files=0 total_bytes=0 fetched_bytes=0 sent_bytes=0 fetched_files=0 sent_files=0
-  local current_index=0 inventory_path inventory_line source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
+  local current_index=0 inventory_path source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
   local fetch_batch_bytes=0 remote_mkdir_command parent_dir candidate_dir known
   local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=()
   local -a dest_directories=()
@@ -327,6 +340,8 @@ run_sync_without_delay() {
   relay_state="$relay_state/$state_hash"
   ND_RELAY_DIR="$relay_state/spool"
   mkdir -p "$ND_RELAY_DIR" "$relay_state/downloaded" "$relay_state/sent" || { say_error 'Cannot create relay state directory'; return 1; }
+  ND_OPERATION_LOG="$relay_state/operations.tsv"
+  [[ -f "$ND_OPERATION_LOG" ]] || printf 'timestamp_utc\tevent\tduration_seconds\tstatus\toperation\n' > "$ND_OPERATION_LOG"
   inventory_path="$relay_state/inventory.nul"
   ND_CONTROL_DIR=$(mktemp -d "${relay_tmpdir%/}/yas-webdeploy-control.XXXXXX") || { say_error 'Cannot create private SSH control directory'; return 1; }
   ND_ASKPASS_HELPER="$askpass_helper"
@@ -353,7 +368,15 @@ run_sync_without_delay() {
   fi
 
   printf -v dest_path_q '%q' "$dest"
-  ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "mkdir -p -- $dest_path_q && test -w $dest_path_q" || { say_error 'The destination directory cannot be created or written'; return 1; }
+  operation_start 'Check destination directory'
+  if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "mkdir -p -- $dest_path_q && test -w $dest_path_q"; then
+    operation_finish 0
+  else
+    local directory_status=$?
+    operation_finish "$directory_status"
+    say_error 'The destination directory cannot be created or written'
+    return "$directory_status"
+  fi
   say_success 'Both endpoints passed the connection and directory checks'
 
   if [[ "$source_kind" == local ]]; then
@@ -390,20 +413,26 @@ run_sync_without_delay() {
     say_info 'Destination cannot pull from source; relaying files through this machine'
   fi
 
-  # Inventory uses tab-separated metadata; the path is the final field and may contain spaces.
+  # NUL-delimited metadata preserves arbitrary path characters, including tabs and newlines.
   if [[ "$source_root" == '~/'* ]]; then
     local source_relative=${source_root#~/} source_relative_q
     printf -v source_relative_q '%q' "$source_relative"
-    source_find_command="cd ~/$source_relative_q && find . \\( -type f -o -type l \\) -printf '%s\\t%T@\\t%P\\n'"
+    source_find_command="cd ~/$source_relative_q && find . \\( -type f -o -type l \\) -printf '%s\\0%T@\\0%P\\0'"
   else
     printf -v source_path_q '%q' "$source_root"
-    source_find_command="find $source_path_q \\( -type f -o -type l \\) -printf '%s\\t%T@\\t%P\\n'"
+    source_find_command="find $source_path_q \\( -type f -o -type l \\) -printf '%s\\0%T@\\0%P\\0'"
   fi
-  say_step 'Scanning source inventory'
-  ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "$source_find_command" > "$inventory_path" || { say_error 'Could not list source files'; return 1; }
-  while IFS= read -r inventory_line; do
-    [[ -z "$inventory_line" ]] && continue
-    parse_inventory_record "$inventory_line" || { say_error 'Invalid source inventory record; refusing to use malformed file metadata'; return 1; }
+  operation_start 'Scan source inventory'
+  if ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "$source_find_command" > "$inventory_path"; then
+    operation_finish 0
+  else
+    local inventory_status=$?
+    operation_finish "$inventory_status"
+    say_error 'Could not list source files'
+    return "$inventory_status"
+  fi
+  while IFS= read -r -d '' file_size && IFS= read -r -d '' file_mtime && IFS= read -r -d '' relative_path; do
+    [[ "$file_size" =~ ^[0-9]+$ && -n "$file_mtime" && -n "$relative_path" ]] || { say_error 'Invalid NUL-delimited source inventory record'; return 1; }
     total_files=$((total_files + 1))
     total_bytes=$((total_bytes + file_size))
   done < "$inventory_path"
@@ -441,8 +470,14 @@ run_sync_without_delay() {
       ND_PROGRESS_FILE=$batch_start_index
       ND_PROGRESS_FILES=$total_files
       ND_PROGRESS_FILE_BYTES=$fetch_batch_bytes
-      say_step "Fetching batch $batch_number (${#batch_paths[@]} files)"
-      run_metered_rsync "$source_ssh_password" rsync -a -r -R --no-owner --no-group --from0 --files-from="$fetch_list" --partial --append-verify --info=progress2 --timeout=30 -e "$source_ssh" "$source_endpoint:${source_root%/}/" "$ND_RELAY_DIR/"
+      operation_start "Fetch batch $batch_number (${#batch_paths[@]} files)"
+      if run_metered_rsync "$source_ssh_password" rsync -a -r -R --no-owner --no-group --from0 --files-from="$fetch_list" --partial --append-verify --info=progress2 --timeout=30 -e "$source_ssh" "$source_endpoint:${source_root%/}/" "$ND_RELAY_DIR/"; then
+        operation_finish 0
+      else
+        local fetch_status=$?
+        operation_finish "$fetch_status"
+        return "$fetch_status"
+      fi
       for i in "${!batch_paths[@]}"; do
         [[ "${batch_needs_fetch[i]}" == true ]] || continue
         path=${batch_paths[i]}
@@ -483,8 +518,14 @@ run_sync_without_delay() {
     ND_PROGRESS_FILE=$batch_start_index
     ND_PROGRESS_FILES=$total_files
     ND_PROGRESS_FILE_BYTES=$batch_bytes
-    say_step "Sending batch $batch_number (${#batch_paths[@]} files)"
-    run_metered_rsync "$ssh_password" rsync -a -r -R --no-owner --no-group --from0 --files-from="$files_list" --partial --append-verify --info=progress2 --timeout=30 -e "$dest_ssh" "$ND_RELAY_DIR/" "$host:$dest/"
+    operation_start "Send batch $batch_number (${#batch_paths[@]} files)"
+    if run_metered_rsync "$ssh_password" rsync -a -r -R --no-owner --no-group --from0 --files-from="$files_list" --partial --append-verify --info=progress2 --timeout=30 -e "$dest_ssh" "$ND_RELAY_DIR/" "$host:$dest/"; then
+      operation_finish 0
+    else
+      local send_status=$?
+      operation_finish "$send_status"
+      return "$send_status"
+    fi
     for i in "${!batch_paths[@]}"; do
       signature="${batch_sizes[i]}|${batch_mtimes[i]}"
       id=${batch_ids[i]}
@@ -506,9 +547,8 @@ run_sync_without_delay() {
     batch_start_index=0
   }
 
-  while IFS= read -r inventory_line; do
-    [[ -z "$inventory_line" ]] && continue
-    parse_inventory_record "$inventory_line" || { say_error 'Invalid source inventory record; refusing to use malformed file metadata'; return 1; }
+  while IFS= read -r -d '' file_size && IFS= read -r -d '' file_mtime && IFS= read -r -d '' relative_path; do
+    [[ "$file_size" =~ ^[0-9]+$ && -n "$file_mtime" && -n "$relative_path" ]] || { say_error 'Invalid NUL-delimited source inventory record'; return 1; }
     current_index=$((current_index + 1))
     file_id=$(printf '%s' "$relative_path" | cksum)
     file_id=${file_id%% *}
@@ -547,6 +587,7 @@ run_sync_without_delay() {
 
   [[ -t 1 ]] && printf '\n'
   say_success "Sync complete: $sent_files/$total_files files sent; $sent_bytes/$total_bytes source bytes delivered"
+  printf 'Operation log: %s\n' "$ND_OPERATION_LOG"
   printf '%s\n' 'Run state retained for safe re-runs.'
 }
 
