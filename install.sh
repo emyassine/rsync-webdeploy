@@ -2,7 +2,7 @@
 # Install the yas-webdeploy command. Deployment logic is in yas-webdeploy.
 set -eu
 
-RAW_BASE='https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main'
+RAW_BASE='https://raw.githubusercontent.com/emyassine/rsync-webdeploy/590acc645e32e3af589deb91611f4b1aeccc1b6e'
 EXPECTED_VERSION='2026.11.05-5'
 INSTALL_DIR="${YAS_WEBDEPLOY_INSTALL_DIR:-$HOME/.local/bin}"
 DEST="$INSTALL_DIR/yas-webdeploy"
