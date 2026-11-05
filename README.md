@@ -76,6 +76,7 @@ DEST=/home/u320478370/domains/earthandskycorp.com/public_html
 Run it from the project directory:
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main/earth_and_sky-web-sync.conf -o earth_and_sky-web-sync.conf
 yas-webdeploy-lite earth_and_sky-web-sync.conf
 ```
 
