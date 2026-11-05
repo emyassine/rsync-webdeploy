@@ -1,5 +1,5 @@
 #!/bin/bash
-YAS_WEBDEPLOY_VERSION='2026.11.05-5'
+YAS_WEBDEPLOY_VERSION='2026.11.05-6'
 #
 # yas-webdeploy
 #
@@ -234,6 +234,23 @@ operation_finish() {
   if [[ "$status" == 0 ]]; then say_success "$ND_OPERATION_NAME completed in ${duration}s"; else say_error "$ND_OPERATION_NAME failed after ${duration}s"; fi
 }
 
+sftp_quote_path() {
+  local value=$1 quoted='' char index
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  for ((index = 0; index < ${#value}; index++)); do
+    char=${value:index:1}
+    case "$char" in
+      \\|\"|\*|\?|\[|\]) quoted+="\\$char" ;;
+      *) quoted+="$char" ;;
+    esac
+  done
+  printf '"%s"' "$quoted"
+}
+
+inventory_signature() {
+  if [[ "$1" == l ]]; then printf 'l|%s|%s|%s' "$2" "$3" "$4"; else printf '%s|%s' "$2" "$3"; fi
+}
+
 cleanup_no_delay() {
   if [[ -n "$ND_SOURCE_SOCKET" && -n "$ND_SOURCE_ENDPOINT" ]]; then
     ssh -S "$ND_SOURCE_SOCKET" -O exit -p "$ND_SOURCE_PORT" "$ND_SOURCE_ENDPOINT" >/dev/null 2>&1 || true
@@ -331,14 +348,17 @@ run_sync_without_delay() {
   local total_files=0 total_bytes=0 fetched_bytes=0 sent_bytes=0 fetched_files=0 sent_files=0
   local current_index=0 inventory_index inventory_path source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
   local fetch_batch_bytes=0 remote_mkdir_command parent_dir candidate_dir known
-  local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=()
+  local direct_sftp_available=false direct_sftp_pull=false direct_sftp_log direct_sftp_output direct_sftp_probe direct_sftp_probe_batch direct_sftp_command direct_sftp_batch direct_sftp_quoted_endpoint direct_sftp_quoted_source direct_sftp_quoted_local direct_sftp_quoted_target direct_sftp_target direct_sftp_stage direct_sftp_finalize direct_sftp_reason direct_sftp_choice sftp_paths_supported=true
+  local file_type link_target destination_file destination_parent destination_stage remote_source_file quoted_stage quoted_final quoted_target stage_hash
+  local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=() batch_types=() batch_link_targets=()
   local -a dest_directories=()
-  local -a inventory_sizes=() inventory_mtimes=() inventory_paths=()
+  local -a inventory_sizes=() inventory_mtimes=() inventory_paths=() inventory_types=() inventory_link_targets=()
 
   ND_SYNC_START_SECONDS=$SECONDS
 
-  check_dependencies ssh rsync find mktemp cksum mkdir mv chmod unlink || return 1
+  check_dependencies ssh find mktemp cksum mkdir mv chmod unlink || return 1
   [[ "$source_path" =~ ^[^/:]+@[^/:]+:.+ ]] && source_kind=remote || source_kind=local
+  [[ "$source_kind" != local ]] || check_dependencies rsync || return 1
   ND_DEST_ENDPOINT="$host"
   ND_DEST_PORT="$ssh_port"
   if [[ "$source_kind" == remote ]]; then
@@ -410,7 +430,7 @@ run_sync_without_delay() {
   # First try a destination-side pull. It needs destination-to-source SSH key access.
   printf -v source_remote_q '%q' "$source_remote"
   printf -v dest_path_q '%q' "$dest/"
-  local direct_probe direct_source_ssh direct_probe_status direct_probe_output direct_probe_log direct_reason direct_choice
+  local direct_probe direct_source_ssh direct_probe_status direct_probe_output direct_probe_log direct_reason direct_choice direct_transfer_status
   printf -v direct_probe_source_q '%q' "$source_endpoint"
   direct_source_ssh="ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6"
   direct_probe="command -v rsync >/dev/null 2>&1 || { echo YAS_DEST_RSYNC_MISSING; exit 20; }; ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6 $direct_probe_source_q 'command -v rsync >/dev/null 2>&1 || { echo YAS_SOURCE_RSYNC_MISSING; exit 21; }'"
@@ -431,50 +451,62 @@ run_sync_without_delay() {
       say_success 'Direct transfer completed; no local relay copy was needed'
       return 0
     fi
-    say_warn 'Direct transfer stopped; continuing through the local relay and resuming completed files'
-  else
-    direct_probe_output=$(<"$direct_probe_log")
+    direct_transfer_status=$?
+    direct_probe_status=$direct_transfer_status
+    direct_probe_output="Direct rsync transfer failed with exit code $direct_transfer_status"
+    say_warn 'Direct rsync transfer stopped; checking direct SFTP before using the local relay'
+  fi
+  if (( direct_probe_status != 0 )); then
+    [[ -n "$direct_probe_output" ]] || direct_probe_output=$(<"$direct_probe_log")
     direct_reason='destination-to-source SSH or rsync check failed'
     case "$direct_probe_output" in
       *YAS_DEST_RSYNC_MISSING*) direct_reason='rsync is not installed on the destination' ;;
       *YAS_SOURCE_RSYNC_MISSING*) direct_reason='rsync is not installed on the source' ;;
-      *'Permission denied'*) direct_reason='the destination has no SSH key authorized on the source; the source password configured on this machine is not forwarded to the destination' ;;
-      *'Connection timed out'*|*'Operation timed out'*) direct_reason='the destination cannot reach the source SSH port (routing or firewall timeout)' ;;
+      *'Host key verification failed'*) direct_reason='the destination has not trusted the source SSH host key' ;;
+      *'Permission denied'*) direct_reason='the destination has no SSH key authorized on the source' ;;
+      *'Direct rsync transfer failed'*) direct_reason="$direct_probe_output" ;;
+      *'Connection timed out'*|*'Operation timed out'*) direct_reason='the destination cannot reach the source SSH port' ;;
       *'Connection refused'*) direct_reason='the source refused SSH connections on the configured port' ;;
       *'Could not resolve hostname'*|*'Name or service not known'*) direct_reason='the destination could not resolve the source hostname' ;;
     esac
-    say_warn "Direct pull unavailable: $direct_reason"
-    say_info 'SFTP from this machine to the destination only proves this machine can upload. Direct pull requires the destination itself to reach the source over SSH and run rsync.'
-    say_info "Probe output is saved in $direct_probe_log"
-    say_info 'Choices: 1) relay through this machine now; this machine downloads then uploads the source, using twice the source traffic and local disk for the current batch; 2) stop and configure destination-to-source SSH key access plus rsync at both ends; 3) cancel.'
-    if [[ -t 0 ]]; then
-      printf 'Choose [1/2/3] (default 1): '
-      IFS= read -r direct_choice || direct_choice=1
-      direct_choice=${direct_choice:-1}
+    say_warn "Direct rsync pull unavailable: $direct_reason"
+    direct_sftp_log="$relay_state/direct-sftp-probe.log"
+    direct_sftp_probe_batch="$relay_state/direct-sftp-probe.batch"
+    direct_sftp_quoted_source=$(sftp_quote_path "$source_root") || { say_error 'SFTP cannot represent a source path with line breaks'; return 1; }
+    printf 'cd %s\n' "$direct_sftp_quoted_source" > "$direct_sftp_probe_batch"
+    direct_sftp_probe="command -v sftp >/dev/null 2>&1 || { echo YAS_DEST_SFTP_MISSING; exit 30; }; sftp -q -b - -P $source_ssh_port -oBatchMode=yes -oConnectTimeout=8 $direct_probe_source_q"
+    operation_start 'Probe destination-to-source SFTP'
+    if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_sftp_probe" < "$direct_sftp_probe_batch" > "$direct_sftp_log" 2>&1; then
+      direct_sftp_available=true
+      operation_finish 0
+      say_success 'The destination can authenticate to the source with SFTP'
     else
-      direct_choice=1
+      local sftp_probe_status=$?
+      operation_finish 0
+      direct_sftp_output=$(<"$direct_sftp_log")
+      direct_sftp_reason='destination-to-source SFTP check failed'
+      case "$direct_sftp_output" in
+        *YAS_DEST_SFTP_MISSING*) direct_sftp_reason='the SFTP client is not installed on the destination' ;;
+        *'Host key verification failed'*) direct_sftp_reason='the destination has not trusted the source SSH host key' ;;
+        *'Permission denied'*) direct_sftp_reason='the destination has no SSH key authorized on the source; the source password configured on this machine is not forwarded to the destination' ;;
+        *'Connection timed out'*|*'Operation timed out'*) direct_sftp_reason='the destination cannot reach the source SSH port (routing or firewall timeout)' ;;
+        *'Connection refused'*) direct_sftp_reason='the source refused SSH connections on the configured port' ;;
+        *'Could not resolve hostname'*|*'Name or service not known'*) direct_sftp_reason='the destination could not resolve the source hostname' ;;
+      esac
+      say_warn "Direct rsync pull failed; direct SFTP is unavailable: $direct_sftp_reason"
+      say_info "SFTP diagnostic: $direct_sftp_log (exit $sftp_probe_status)"
     fi
-    case "$direct_choice" in
-      1) say_info 'Continuing with the resumable local relay' ;;
-      2)
-        say_info 'From the destination, install or confirm rsync, create an SSH key if needed, and authorize its public key in the source account authorized_keys file.'
-        say_info 'Then, from the destination, verify: ssh -p <source-port> <source-user>@<source-host> "command -v rsync"'
-        say_info 'Rerun yas-webdeploy after that check succeeds.'
-        return 2
-        ;;
-      3) say_info 'Cancelled before transferring files'; return 1 ;;
-      *) say_error 'Choose 1, 2, or 3'; return 2 ;;
-    esac
+    say_info "Rsync diagnostic: $direct_probe_log"
   fi
 
   # NUL-delimited metadata preserves arbitrary path characters, including tabs and newlines.
   if [[ "$source_root" == '~/'* ]]; then
     local source_relative=${source_root#~/} source_relative_q
     printf -v source_relative_q '%q' "$source_relative"
-    source_find_command="cd ~/$source_relative_q && find . \\( -type f -o -type l \\) -printf '%s\\0%T@\\0%P\\0'"
+    source_find_command="cd ~/$source_relative_q && find . \\( -type f -o -type l \\) -printf '%y\\0%s\\0%T@\\0%P\\0%l\\0'"
   else
     printf -v source_path_q '%q' "$source_root"
-    source_find_command="find $source_path_q \\( -type f -o -type l \\) -printf '%s\\0%T@\\0%P\\0'"
+    source_find_command="find $source_path_q \\( -type f -o -type l \\) -printf '%y\\0%s\\0%T@\\0%P\\0%l\\0'"
   fi
   operation_start 'Scan source inventory'
   if ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "$source_find_command" > "$inventory_path"; then
@@ -485,13 +517,13 @@ run_sync_without_delay() {
     say_error 'Could not list source files'
     return "$inventory_status"
   fi
-  while IFS= read -r -d '' file_size; do
-    if ! IFS= read -r -d '' file_mtime || ! IFS= read -r -d '' relative_path; then
+  while IFS= read -r -d '' file_type; do
+    if ! IFS= read -r -d '' file_size || ! IFS= read -r -d '' file_mtime || ! IFS= read -r -d '' relative_path || ! IFS= read -r -d '' link_target; then
       say_error "Source inventory ended in the middle of entry $((total_files + 1))"
       return 1
     fi
-    if [[ ! "$file_size" =~ ^[0-9]+$ || -z "$file_mtime" || -z "$relative_path" ]]; then
-      say_error "Invalid source inventory entry $((total_files + 1)); size, timestamp, or path field is empty or malformed"
+    if [[ ( "$file_type" != f && "$file_type" != l ) || ! "$file_size" =~ ^[0-9]+$ || -z "$file_mtime" || -z "$relative_path" || ( "$file_type" == l && -z "$link_target" ) ]]; then
+      say_error "Invalid source inventory entry $((total_files + 1)); type, size, timestamp, or path field is malformed"
       return 1
     fi
     total_files=$((total_files + 1))
@@ -499,9 +531,54 @@ run_sync_without_delay() {
     inventory_sizes+=("$file_size")
     inventory_mtimes+=("$file_mtime")
     inventory_paths+=("$relative_path")
+    inventory_types+=("$file_type")
+    inventory_link_targets+=("$link_target")
+    [[ "$relative_path" != *$'\n'* && "$relative_path" != *$'\r'* ]] || sftp_paths_supported=false
   done < "$inventory_path"
   (( total_files > 0 )) || { say_error 'The source directory contains no regular files'; return 1; }
-  ND_PROGRESS_TOTAL=$((total_bytes * 2))
+  if [[ "$direct_sftp_available" == true && "$sftp_paths_supported" != true ]]; then
+    direct_sftp_available=false
+    direct_sftp_reason='a source path contains a line break, which SFTP batch commands cannot safely represent'
+    say_warn "Direct SFTP is unavailable: $direct_sftp_reason; the relay remains available"
+  fi
+  if [[ "$direct_sftp_available" == true ]]; then
+    ND_PROGRESS_TOTAL=$total_bytes
+    say_info 'Choices: 1) pull directly from the source to the destination with SFTP; 2) relay through this machine with rsync; 3) cancel.'
+    if [[ -t 0 ]]; then
+      printf 'Choose [1/2/3] (default 1): '
+      IFS= read -r direct_sftp_choice || direct_sftp_choice=1
+      direct_sftp_choice=${direct_sftp_choice:-1}
+    else
+      direct_sftp_choice=1
+    fi
+    case "$direct_sftp_choice" in
+      1) direct_sftp_pull=true; say_info 'Selected direct SFTP pull; file data will not pass through this machine' ;;
+      2) ND_PROGRESS_TOTAL=$((total_bytes * 2)); say_info 'Selected resumable rsync relay through this machine' ;;
+      3) say_info 'Cancelled before transferring files'; return 1 ;;
+      *) say_error 'Choose 1, 2, or 3'; return 2 ;;
+    esac
+  else
+    ND_PROGRESS_TOTAL=$((total_bytes * 2))
+    say_info 'Choices: 1) relay through this machine with rsync; 2) stop and configure destination-to-source SFTP access; 3) cancel.'
+    if [[ -t 0 ]]; then
+      printf 'Choose [1/2/3] (default 1): '
+      IFS= read -r direct_sftp_choice || direct_sftp_choice=1
+      direct_sftp_choice=${direct_sftp_choice:-1}
+    else
+      direct_sftp_choice=1
+    fi
+    case "$direct_sftp_choice" in
+      1) say_info 'Continuing with the resumable rsync relay' ;;
+      2)
+        say_info 'On the destination, verify the source host key, authorize the destination SSH public key on the source, and confirm an SFTP client is installed.'
+        say_info 'Then test: sftp -P <source-port> <source-user>@<source-host>'
+        return 2
+        ;;
+      3) say_info 'Cancelled before transferring files'; return 1 ;;
+      *) say_error 'Choose 1, 2, or 3'; return 2 ;;
+    esac
+  fi
+  if [[ "$direct_sftp_pull" != true ]]; then check_dependencies rsync || return 1; fi
   say_info "Queued $total_files files ($total_bytes bytes); small files will be sent in short batches"
   say_info "Resume state: $relay_state"
 
@@ -528,7 +605,7 @@ run_sync_without_delay() {
       fi
     done
 
-    if (( fetch_batch_bytes > 0 )); then
+    if [[ "$direct_sftp_pull" != true ]] && (( fetch_batch_bytes > 0 )); then
       ND_PROGRESS_BASE=$((fetched_bytes + sent_bytes))
       ND_PROGRESS_PHASE='fetch'
       ND_PROGRESS_FILE=$batch_start_index
@@ -547,7 +624,7 @@ run_sync_without_delay() {
         path=${batch_paths[i]}
         local_item="$ND_RELAY_DIR/$path"
         [[ -e "$local_item" || -L "$local_item" ]] || { say_error "Source transfer did not create $path in the relay"; return 1; }
-        signature="${batch_sizes[i]}|${batch_mtimes[i]}"
+        signature=$(inventory_signature "${batch_types[i]}" "${batch_sizes[i]}" "${batch_mtimes[i]}" "${batch_link_targets[i]}")
         id=${batch_ids[i]}
         marker="$relay_state/downloaded/$id"
         printf '%s\n' "$signature" > "$marker.tmp.$$"
@@ -577,36 +654,78 @@ run_sync_without_delay() {
       ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$remote_mkdir_command" || { say_error "Cannot prepare destination directories for batch $batch_number"; return 1; }
     fi
 
-    ND_PROGRESS_BASE=$((fetched_bytes + sent_bytes))
+    if [[ "$direct_sftp_pull" == true ]]; then ND_PROGRESS_BASE=$sent_bytes; else ND_PROGRESS_BASE=$((fetched_bytes + sent_bytes)); fi
     ND_PROGRESS_PHASE='send'
     ND_PROGRESS_FILE=$batch_start_index
     ND_PROGRESS_FILES=$total_files
     ND_PROGRESS_FILE_BYTES=$batch_bytes
-    operation_start "Send batch $batch_number (${#batch_paths[@]} files)"
-    if run_metered_rsync "$ssh_password" rsync -a -r -R --no-owner --no-group --from0 --files-from="$files_list" --partial --append-verify --info=progress2 --timeout=30 -e "$dest_ssh" "$ND_RELAY_DIR/" "$host:$dest/"; then
-      operation_finish 0
+    if [[ "$direct_sftp_pull" == true ]]; then
+      direct_sftp_batch="$relay_state/batch.sftp"
+      direct_sftp_finalize='set -e'
+      : > "$direct_sftp_batch"
+      for i in "${!batch_paths[@]}"; do
+        path=${batch_paths[i]}
+        destination_file="$dest/$path"
+        parent_rel=${path%/*}
+        if [[ "$parent_rel" == "$path" ]]; then destination_parent=$dest; else destination_parent="$dest/$parent_rel"; fi
+        stage_hash=$(printf '%s' "${batch_sizes[i]}|${batch_mtimes[i]}|${batch_link_targets[i]}" | cksum)
+        stage_hash=${stage_hash%% *}
+        destination_stage="$destination_parent/.${path##*/}.yas-webdeploy-partial.${batch_ids[i]}.$stage_hash"
+        printf -v quoted_final '%q' "$destination_file"
+        if [[ "${batch_types[i]}" == l ]]; then
+          printf -v quoted_target '%q' "${batch_link_targets[i]}"
+          direct_sftp_finalize+=" && ln -sfn -- $quoted_target $quoted_final"
+        else
+          remote_source_file="${source_root%/}/${path}"
+          direct_sftp_quoted_source=$(sftp_quote_path "$remote_source_file") || { say_error 'SFTP cannot represent a source path with line breaks'; return 1; }
+          direct_sftp_quoted_local=$(sftp_quote_path "$destination_stage") || { say_error 'SFTP cannot represent a destination path with line breaks'; return 1; }
+          printf 'reget -p %s %s\n' "$direct_sftp_quoted_source" "$direct_sftp_quoted_local" >> "$direct_sftp_batch"
+          printf -v quoted_stage '%q' "$destination_stage"
+          direct_sftp_finalize+=" && mv -f -- $quoted_stage $quoted_final"
+        fi
+      done
+      printf -v direct_sftp_quoted_endpoint '%q' "$source_endpoint"
+      direct_sftp_command="sftp -b - -P $source_ssh_port -oBatchMode=yes $direct_sftp_quoted_endpoint"
+      operation_start "Pull batch $batch_number directly from source with SFTP"
+      if { [[ ! -s "$direct_sftp_batch" ]] || ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_sftp_command" < "$direct_sftp_batch"; } && ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_sftp_finalize"; then
+        operation_finish 0
+      else
+        local sftp_transfer_status=$?
+        operation_finish "$sftp_transfer_status"
+        say_error "Direct SFTP batch $batch_number failed; partial staging files remain on the destination for a retry"
+        return "$sftp_transfer_status"
+      fi
     else
-      local send_status=$?
-      operation_finish "$send_status"
-      return "$send_status"
+      operation_start "Send batch $batch_number (${#batch_paths[@]} files)"
+      if run_metered_rsync "$ssh_password" rsync -a -r -R --no-owner --no-group --from0 --files-from="$files_list" --partial --append-verify --info=progress2 --timeout=30 -e "$dest_ssh" "$ND_RELAY_DIR/" "$host:$dest/"; then
+        operation_finish 0
+      else
+        local send_status=$?
+        operation_finish "$send_status"
+        return "$send_status"
+      fi
     fi
     for i in "${!batch_paths[@]}"; do
-      signature="${batch_sizes[i]}|${batch_mtimes[i]}"
+      signature=$(inventory_signature "${batch_types[i]}" "${batch_sizes[i]}" "${batch_mtimes[i]}" "${batch_link_targets[i]}")
       id=${batch_ids[i]}
       marker="$relay_state/sent/$id"
       printf '%s\n' "$signature" > "$marker.tmp.$$"
       mv -f -- "$marker.tmp.$$" "$marker"
-      local_item="$ND_RELAY_DIR/${batch_paths[i]}"
-      [[ ! -e "$local_item" && ! -L "$local_item" ]] || unlink "$local_item"
+      if [[ "$direct_sftp_pull" != true ]]; then
+        local_item="$ND_RELAY_DIR/${batch_paths[i]}"
+        [[ ! -e "$local_item" && ! -L "$local_item" ]] || unlink "$local_item"
+      fi
       sent_bytes=$((sent_bytes + batch_sizes[i]))
       sent_files=$((sent_files + 1))
     done
-    overall_progress_line "$((fetched_bytes + sent_bytes))" "$ND_PROGRESS_TOTAL" 'sent' "$((batch_start_index + ${#batch_paths[@]} - 1))" "$total_files"
+    if [[ "$direct_sftp_pull" == true ]]; then overall_progress_line "$sent_bytes" "$ND_PROGRESS_TOTAL" 'sftp' "$((batch_start_index + ${#batch_paths[@]} - 1))" "$total_files"; else overall_progress_line "$((fetched_bytes + sent_bytes))" "$ND_PROGRESS_TOTAL" 'sent' "$((batch_start_index + ${#batch_paths[@]} - 1))" "$total_files"; fi
     batch_paths=()
     batch_sizes=()
     batch_mtimes=()
     batch_ids=()
     batch_needs_fetch=()
+    batch_types=()
+    batch_link_targets=()
     batch_bytes=0
     batch_start_index=0
   }
@@ -615,27 +734,31 @@ run_sync_without_delay() {
     file_size=${inventory_sizes[inventory_index]}
     file_mtime=${inventory_mtimes[inventory_index]}
     relative_path=${inventory_paths[inventory_index]}
+    file_type=${inventory_types[inventory_index]}
+    link_target=${inventory_link_targets[inventory_index]}
     current_index=$((current_index + 1))
     file_id=$(printf '%s' "$relative_path" | cksum)
     file_id=${file_id%% *}
-    signature="$file_size|$file_mtime"
+    signature=$(inventory_signature "$file_type" "$file_size" "$file_mtime" "$link_target")
     marker="$relay_state/sent/$file_id"
     if [[ -f "$marker" ]] && IFS= read -r value < "$marker" && [[ "$value" == "$signature" ]]; then
-      fetched_bytes=$((fetched_bytes + file_size))
+      if [[ "$direct_sftp_pull" != true ]]; then fetched_bytes=$((fetched_bytes + file_size)); fi
       sent_bytes=$((sent_bytes + file_size))
-      fetched_files=$((fetched_files + 1))
+      if [[ "$direct_sftp_pull" != true ]]; then fetched_files=$((fetched_files + 1)); fi
       sent_files=$((sent_files + 1))
-      overall_progress_line "$((fetched_bytes + sent_bytes))" "$ND_PROGRESS_TOTAL" 'sent' "$current_index" "$total_files"
+      if [[ "$direct_sftp_pull" == true ]]; then overall_progress_line "$sent_bytes" "$ND_PROGRESS_TOTAL" 'sftp' "$current_index" "$total_files"; else overall_progress_line "$((fetched_bytes + sent_bytes))" "$ND_PROGRESS_TOTAL" 'sent' "$current_index" "$total_files"; fi
       continue
     fi
 
-    local_file="$ND_RELAY_DIR/$relative_path"
-    marker="$relay_state/downloaded/$file_id"
     local have_file=false
-    if [[ -f "$marker" && ( -e "$local_file" || -L "$local_file" ) ]] && IFS= read -r value < "$marker" && [[ "$value" == "$signature" ]]; then
-      have_file=true
-      fetched_bytes=$((fetched_bytes + file_size))
-      fetched_files=$((fetched_files + 1))
+    if [[ "$direct_sftp_pull" != true ]]; then
+      local_file="$ND_RELAY_DIR/$relative_path"
+      marker="$relay_state/downloaded/$file_id"
+      if [[ -f "$marker" && ( -e "$local_file" || -L "$local_file" ) ]] && IFS= read -r value < "$marker" && [[ "$value" == "$signature" ]]; then
+        have_file=true
+        fetched_bytes=$((fetched_bytes + file_size))
+        fetched_files=$((fetched_files + 1))
+      fi
     fi
     if (( ${#batch_paths[@]} == 0 )); then batch_start_index=$current_index; fi
     batch_paths+=("$relative_path")
@@ -643,6 +766,8 @@ run_sync_without_delay() {
     batch_mtimes+=("$file_mtime")
     batch_ids+=("$file_id")
     batch_needs_fetch+=("$([[ "$have_file" == true ]] && printf false || printf true)")
+    batch_types+=("$file_type")
+    batch_link_targets+=("$link_target")
     batch_bytes=$((batch_bytes + file_size))
 
     if (( ${#batch_paths[@]} >= 32 || batch_bytes >= 8388608 )); then
