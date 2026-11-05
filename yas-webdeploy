@@ -16,7 +16,7 @@
 # License: MPL-2.0
 #
 # Usage:
-#   yas-webdeploy [config.json]
+#   yas-webdeploy [--sync-without-delai] [profile]
 #
 # Configuration:
 #   Edit web-sync.config.json or pass a profile path as the first argument
@@ -24,6 +24,11 @@
 
 set -euo pipefail
 
+SYNC_WITHOUT_DELAY=false
+if [[ "${1:-}" == --sync-without-delai ]]; then
+  SYNC_WITHOUT_DELAY=true
+  shift
+fi
 CONFIG_FILE="${1:-$PWD/web-sync.config.json}"
 if [[ "$CONFIG_FILE" != /* ]]; then CONFIG_FILE="$PWD/$CONFIG_FILE"; fi
 CONFIG_DIR="${CONFIG_FILE%/*}"
@@ -172,13 +177,290 @@ run_post_deploy() {
 
 show_help() {
   cat <<'HELP'
-Usage: yas-webdeploy [profile]
+Usage: yas-webdeploy [--sync-without-delai] [profile]
 
 Pass a .json profile for the full deployment workflow (requires jq), or a
 KEY=value profile for the simple SSH/rsync workflow (no jq required).
 KEY=value profiles support SOURCE=. for local files or SOURCE=user@host:/path
 for a remote source. Remote sources are relayed through this machine.
+--sync-without-delai preflights both servers, tries direct remote transfer,
+and otherwise relays one file at a time with resumable tracking.
 HELP
+}
+
+# Active state is global so the EXIT trap can clean up even after a function returns.
+ND_CONTROL_DIR=''
+ND_RELAY_DIR=''
+ND_ASKPASS_HELPER=''
+ND_SOURCE_SOCKET=''
+ND_DEST_SOCKET=''
+ND_SOURCE_ENDPOINT=''
+ND_DEST_ENDPOINT=''
+ND_SOURCE_PORT=''
+ND_DEST_PORT=''
+ND_PROGRESS_BASE=0
+ND_PROGRESS_TOTAL=1
+ND_PROGRESS_PHASE=''
+ND_PROGRESS_FILE=0
+ND_PROGRESS_FILES=0
+ND_PROGRESS_FILE_BYTES=0
+
+cleanup_no_delay() {
+  if [[ -n "$ND_SOURCE_SOCKET" && -n "$ND_SOURCE_ENDPOINT" ]]; then
+    ssh -S "$ND_SOURCE_SOCKET" -O exit -p "$ND_SOURCE_PORT" "$ND_SOURCE_ENDPOINT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$ND_DEST_SOCKET" && -n "$ND_DEST_ENDPOINT" ]]; then
+    ssh -S "$ND_DEST_SOCKET" -O exit -p "$ND_DEST_PORT" "$ND_DEST_ENDPOINT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$ND_CONTROL_DIR" && -d "$ND_CONTROL_DIR" ]]; then
+    find "$ND_CONTROL_DIR" -depth -delete >/dev/null 2>&1 || true
+  fi
+  [[ -z "$ND_ASKPASS_HELPER" ]] || unlink "$ND_ASKPASS_HELPER" >/dev/null 2>&1 || true
+}
+
+overall_progress_line() {
+  local done_bytes=$1 total_bytes=$2 phase=$3 file_index=$4 file_count=$5
+  local width=28 percent=0 filled blank_bar fill_bar rest_bar
+  (( total_bytes > 0 )) && percent=$((done_bytes * 100 / total_bytes))
+  (( percent > 100 )) && percent=100
+  filled=$((percent * width / 100))
+  printf -v blank_bar '%*s' "$width" ''
+  fill_bar=${blank_bar:0:filled}
+  rest_bar=${blank_bar:filled}
+  fill_bar=${fill_bar// /#}
+  rest_bar=${rest_bar// /-}
+  if [[ -t 1 ]]; then
+    printf '\r\033[K[%s%s] %3d%% %-8s file %d/%d' "$fill_bar" "$rest_bar" "$percent" "$phase" "$file_index" "$file_count"
+  else
+    printf '[%s%s] %3d%% %-8s file %d/%d\n' "$fill_bar" "$rest_bar" "$percent" "$phase" "$file_index" "$file_count"
+  fi
+}
+
+consume_rsync_progress() {
+  local line current_bytes done_bytes last_percent=-1
+  while IFS= read -r -d $'\r' line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*([0-9,]+)[[:space:]]+([0-9]+)% ]]; then
+      current_bytes=${BASH_REMATCH[1]//,/}
+      (( current_bytes > ND_PROGRESS_FILE_BYTES )) && current_bytes=$ND_PROGRESS_FILE_BYTES
+      done_bytes=$((ND_PROGRESS_BASE + current_bytes))
+      local percent=0
+      (( ND_PROGRESS_TOTAL > 0 )) && percent=$((done_bytes * 100 / ND_PROGRESS_TOTAL))
+      if [[ -t 1 || "$percent" != "$last_percent" ]]; then
+        overall_progress_line "$done_bytes" "$ND_PROGRESS_TOTAL" "$ND_PROGRESS_PHASE" "$ND_PROGRESS_FILE" "$ND_PROGRESS_FILES"
+        last_percent=$percent
+      fi
+    elif [[ -n "${line//$'\n'/}" ]]; then
+      [[ -t 1 ]] && printf '\r\033[K'
+      printf '%s\n' "$line"
+    fi
+  done
+  [[ -t 1 ]] && printf '\r\033[K'
+}
+
+run_metered_rsync() {
+  local password=$1
+  shift
+  local status
+  set +e
+  if [[ -n "$password" ]]; then
+    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$password" SSH_ASKPASS="$ND_ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-yas-webdeploy:0}" LC_ALL=C "$@" 2>&1 | consume_rsync_progress
+  else
+    LC_ALL=C "$@" 2>&1 | consume_rsync_progress
+  fi
+  status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
+open_ssh_master() {
+  local endpoint=$1 port=$2 socket=$3 password=$4 label=$5
+  local -a options=(-M -N -f -S "$socket" -o ControlMaster=yes -o ControlPersist=24h -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -p "$port")
+  say_step "Checking $label connection"
+  if [[ -n "$password" ]]; then
+    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$password" SSH_ASKPASS="$ND_ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force DISPLAY="${DISPLAY:-yas-webdeploy:0}" ssh "${options[@]}" "$endpoint"
+  else
+    ssh "${options[@]}" -o BatchMode=yes "$endpoint"
+  fi
+  say_success "$label connection is ready"
+}
+
+run_sync_without_delay() {
+  local server=$1 user=$2 ssh_port=$3 dest=$4 ssh_password=$5
+  local source_path=$6 source_ssh_port=$7 source_ssh_password=$8 relay_tmpdir=$9
+  local host="$user@$server" source_remote='' source_endpoint='' source_root=''
+  local dest_control_path source_control_path dest_ssh source_ssh relay_state inventory state_hash
+  local source_kind direct_command source_remote_q dest_path_q source_path_q remote_parent_q remote_command
+  local file_size file_mtime relative_path file_id marker signature local_file parent_path
+  local total_files=0 total_bytes=0 fetched_bytes=0 sent_bytes=0 fetched_files=0 sent_files=0
+  local current_index=0 inventory_path source_find_command count_sent=0
+
+  check_dependencies ssh rsync find mktemp cksum mkdir mv chmod unlink || return 1
+  [[ "$source_path" =~ ^[^/:]+@[^/:]+:.+ ]] && source_kind=remote || source_kind=local
+  ND_DEST_ENDPOINT="$host"
+  ND_DEST_PORT="$ssh_port"
+  if [[ "$source_kind" == remote ]]; then
+    source_remote="$source_path"
+    [[ "$source_remote" == */ ]] || source_remote+="/"
+    source_endpoint=${source_remote%%:*}
+    source_root=${source_remote#*:}
+    ND_SOURCE_ENDPOINT="$source_endpoint"
+    ND_SOURCE_PORT="$source_ssh_port"
+  fi
+
+  relay_state="${XDG_STATE_HOME:-$HOME/.local/state}/yas-webdeploy"
+  state_hash=$(printf '%s' "$CONFIG_FILE" | cksum)
+  state_hash=${state_hash%% *}
+  relay_state="$relay_state/$state_hash"
+  ND_RELAY_DIR="$relay_state/spool"
+  mkdir -p "$ND_RELAY_DIR" "$relay_state/downloaded" "$relay_state/sent" || { say_error 'Cannot create relay state directory'; return 1; }
+  inventory_path="$relay_state/inventory.nul"
+  ND_CONTROL_DIR=$(mktemp -d "${relay_tmpdir%/}/yas-webdeploy-control.XXXXXX") || { say_error 'Cannot create private SSH control directory'; return 1; }
+  ND_ASKPASS_HELPER="$askpass_helper"
+  ND_SOURCE_SOCKET="$ND_CONTROL_DIR/source-%C"
+  ND_DEST_SOCKET="$ND_CONTROL_DIR/destination-%C"
+  trap cleanup_no_delay EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  open_ssh_master "$host" "$ssh_port" "$ND_DEST_SOCKET" "$ssh_password" 'destination'
+  if [[ "$source_kind" == remote ]]; then
+    open_ssh_master "$source_endpoint" "$source_ssh_port" "$ND_SOURCE_SOCKET" "$source_ssh_password" 'source'
+    if [[ "$source_root" == '~/'* ]]; then
+      local source_relative=${source_root#~/} source_relative_q
+      printf -v source_relative_q '%q' "$source_relative"
+      ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "cd ~/$source_relative_q && test -d ." || { say_error 'The remote source directory is not accessible'; return 1; }
+    else
+      printf -v source_path_q '%q' "$source_root"
+      ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "test -d $source_path_q" || { say_error 'The remote source directory is not accessible'; return 1; }
+    fi
+  else
+    [[ -d "$source_path" ]] || { say_error "Source directory not found: $source_path"; return 1; }
+  fi
+
+  printf -v dest_path_q '%q' "$dest"
+  ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "mkdir -p -- $dest_path_q && test -w $dest_path_q" || { say_error 'The destination directory cannot be created or written'; return 1; }
+  say_success 'Both endpoints passed the connection and directory checks'
+
+  if [[ "$source_kind" == local ]]; then
+    dest_ssh="ssh -S $(printf '%q' "$ND_DEST_SOCKET") -o ControlMaster=auto -o ControlPersist=24h -p $ssh_port -o ConnectTimeout=15"
+    [[ -n "$ssh_password" ]] || dest_ssh+=" -o BatchMode=yes"
+    if [[ -n "$ssh_password" ]]; then
+      rsync -az --no-owner --no-group --partial --append-verify --info=progress2 --no-inc-recursive --stats --timeout=30 -e "$dest_ssh" "$source_path/" "$host:$dest/"
+    else
+      rsync -az --no-owner --no-group --partial --append-verify --info=progress2 --no-inc-recursive --stats --timeout=30 -e "$dest_ssh" "$source_path/" "$host:$dest/"
+    fi
+    say_success 'Local source synchronized directly to destination'
+    return 0
+  fi
+
+  # First try a destination-side pull. It needs destination-to-source SSH key access.
+  printf -v source_remote_q '%q' "$source_remote"
+  printf -v dest_path_q '%q' "$dest/"
+  local direct_probe direct_source_ssh
+  printf -v direct_probe_source_q '%q' "$source_endpoint"
+  direct_source_ssh="ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6"
+  direct_probe="command -v rsync >/dev/null 2>&1 && ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6 $direct_probe_source_q true"
+  say_step 'Checking whether destination can pull directly from source'
+  if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_probe" >/dev/null 2>&1; then
+    printf -v direct_source_q '%q' "$source_remote"
+    direct_command="rsync -az --no-owner --no-group --partial --append-verify --info=progress2 --no-inc-recursive --stats --timeout=30 -e '$direct_source_ssh' $direct_source_q $dest_path_q"
+    say_step 'Direct source-to-destination transfer (overall progress)'
+    if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_command"; then
+      printf '%s\n' 'direct transfer completed' > "$relay_state/direct-complete"
+      say_success 'Direct transfer completed; no local relay copy was needed'
+      return 0
+    fi
+    say_warn 'Direct transfer stopped; continuing through the local relay and resuming completed files'
+  else
+    say_info 'Destination cannot pull from source; relaying files through this machine'
+  fi
+
+  # Inventory records each file's size, modification time, and relative path as NUL-separated fields.
+  if [[ "$source_root" == '~/'* ]]; then
+    local source_relative=${source_root#~/} source_relative_q
+    printf -v source_relative_q '%q' "$source_relative"
+    source_find_command="cd ~/"$source_relative_q" && find . \( -type f -o -type l \) -printf '%s\\0%T@\\0%P\\0'"
+  else
+    printf -v source_path_q '%q' "$source_root"
+    source_find_command="find $source_path_q \( -type f -o -type l \) -printf '%s\\0%T@\\0%P\\0'"
+  fi
+  say_step 'Scanning source inventory'
+  ssh -S "$ND_SOURCE_SOCKET" -p "$source_ssh_port" "$source_endpoint" "$source_find_command" > "$inventory_path" || { say_error 'Could not list source files'; return 1; }
+  while IFS= read -r -d '' file_size && IFS= read -r -d '' file_mtime && IFS= read -r -d '' relative_path; do
+    total_files=$((total_files + 1))
+    total_bytes=$((total_bytes + file_size))
+  done < "$inventory_path"
+  (( total_files > 0 )) || { say_error 'The source directory contains no regular files'; return 1; }
+  ND_PROGRESS_TOTAL=$((total_bytes * 2))
+  say_info "Queued $total_files files ($total_bytes bytes); each file is fetched then sent immediately"
+  say_info "Resume state: $relay_state"
+
+  while IFS= read -r -d '' file_size && IFS= read -r -d '' file_mtime && IFS= read -r -d '' relative_path; do
+    current_index=$((current_index + 1))
+    file_id=$(printf '%s' "$relative_path" | cksum)
+    file_id=${file_id%% *}
+    signature="$file_size|$file_mtime"
+    marker="$relay_state/sent/$file_id"
+    if [[ -f "$marker" ]] && IFS= read -r value < "$marker" && [[ "$value" == "$signature" ]]; then
+      fetched_bytes=$((fetched_bytes + file_size))
+      sent_bytes=$((sent_bytes + file_size))
+      fetched_files=$((fetched_files + 1))
+      sent_files=$((sent_files + 1))
+      continue
+    fi
+
+    local_file="$ND_RELAY_DIR/$relative_path"
+    parent_path=${local_file%/*}
+    mkdir -p "$parent_path" || { say_error "Cannot prepare local relay path for $relative_path"; return 1; }
+    marker="$relay_state/downloaded/$file_id"
+    local have_file=false
+    if [[ -f "$marker" && -f "$local_file" ]] && IFS= read -r value < "$marker" && [[ "$value" == "$signature" ]]; then
+      have_file=true
+    fi
+    if [[ "$have_file" != true ]]; then
+      ND_PROGRESS_BASE=$((fetched_bytes + sent_bytes))
+      ND_PROGRESS_PHASE='fetch'
+      ND_PROGRESS_FILE=$current_index
+      ND_PROGRESS_FILES=$total_files
+      ND_PROGRESS_FILE_BYTES=$file_size
+      source_ssh="ssh -S $(printf '%q' "$ND_SOURCE_SOCKET") -o ControlMaster=auto -o ControlPersist=24h -p $source_ssh_port -o ConnectTimeout=15"
+      [[ -n "$source_ssh_password" ]] || source_ssh+=" -o BatchMode=yes"
+      source_file="$source_endpoint:${source_root%/}/./$relative_path"
+      say_step "Fetching $relative_path ($current_index/$total_files)"
+      run_metered_rsync "$source_ssh_password" rsync -aR --no-owner --no-group --partial --append-verify --info=progress2 --timeout=30 -e "$source_ssh" "$source_file" "$ND_RELAY_DIR/"
+      printf '%s\n' "$signature" > "$marker.tmp.$$"
+      mv -f -- "$marker.tmp.$$" "$marker"
+      fetched_bytes=$((fetched_bytes + file_size))
+      fetched_files=$((fetched_files + 1))
+    else
+      fetched_bytes=$((fetched_bytes + file_size))
+    fi
+
+    parent_path=${relative_path%/*}
+    if [[ "$parent_path" != "$relative_path" ]]; then
+      printf -v remote_parent_q '%q' "$dest/$parent_path"
+      ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "mkdir -p -- $remote_parent_q" || { say_error "Cannot create destination directory for $relative_path"; return 1; }
+    fi
+    ND_PROGRESS_BASE=$((fetched_bytes + sent_bytes))
+    ND_PROGRESS_PHASE='send'
+    ND_PROGRESS_FILE=$current_index
+    ND_PROGRESS_FILES=$total_files
+    ND_PROGRESS_FILE_BYTES=$file_size
+    dest_ssh="ssh -S $(printf '%q' "$ND_DEST_SOCKET") -o ControlMaster=auto -o ControlPersist=24h -p $ssh_port -o ConnectTimeout=15"
+    [[ -n "$ssh_password" ]] || dest_ssh+=" -o BatchMode=yes"
+    say_step "Sending $relative_path ($current_index/$total_files)"
+    run_metered_rsync "$ssh_password" rsync -a --no-owner --no-group --partial --append-verify --info=progress2 --timeout=30 -e "$dest_ssh" "$local_file" "$host:$dest/$relative_path"
+    printf '%s\n' "$signature" > "$relay_state/sent/$file_id.tmp.$$"
+    mv -f -- "$relay_state/sent/$file_id.tmp.$$" "$relay_state/sent/$file_id"
+    unlink "$local_file"
+    sent_bytes=$((sent_bytes + file_size))
+    sent_files=$((sent_files + 1))
+  done < "$inventory_path"
+
+  [[ -t 1 ]] && printf '\n'
+  say_success "Sync complete: $sent_files/$total_files files sent; $sent_bytes/$total_bytes source bytes delivered"
+  printf '%s\n' 'Run state retained for safe re-runs.'
 }
 
 run_key_value_profile() {
@@ -271,6 +553,11 @@ run_key_value_profile() {
     chmod 700 "$askpass_helper" || { rm -f -- "$askpass_helper"; fail_profile 'Could not secure SSH askpass helper'; return 1; }
   fi
 
+  if [[ "$SYNC_WITHOUT_DELAY" == true ]]; then
+    run_sync_without_delay "$server" "$user" "$ssh_port" "$dest" "$ssh_password" "$source_path" "$source_ssh_port" "$source_ssh_password" "$relay_tmpdir"
+    return $?
+  fi
+
   cleanup_profile() {
     [[ -z "$relay_dir" ]] || find "$relay_dir" -depth -delete
     [[ -z "$askpass_helper" ]] || rm -f -- "$askpass_helper"
@@ -326,6 +613,10 @@ check_dependencies "${BASE_DEPENDENCIES[@]}"
 if jq -e '(.this_machine | type == "object") and (.source | type == "object") and (.destination | type == "object") and (.deployments | type == "array")' "$CONFIG_FILE" >/dev/null; then
   run_key_value_profile
   exit $?
+fi
+if [[ "$SYNC_WITHOUT_DELAY" == true ]]; then
+  say_error 'The legacy JSON schema cannot use --sync-without-delai; use the nested source/destination profile.'
+  exit 2
 fi
 jq -e 'type == "object" and (.deploys | type == "object")' "$CONFIG_FILE" >/dev/null || {
   say_error "Invalid JSON config or missing deploys object: $CONFIG_FILE"

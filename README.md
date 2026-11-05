@@ -51,6 +51,19 @@ yas-webdeploy web-sync.config.json
 
 The JSON schema and configuration examples are documented in the project history. SSH and sudo password fields in JSON are used only when `unsafe_mode` is enabled.
 
+
+## Immediate relay mode
+
+Run a nested JSON profile with:
+
+```sh
+yas-webdeploy --sync-without-delai web-sync.config.json
+```
+
+It checks SSH access to both endpoints before transferring and keeps those SSH control connections open. If the destination can SSH to the source with a key, it pulls directly. Otherwise it relays one file at a time through this machine, tracking fetched and sent files under `~/.local/state/yas-webdeploy/`. Partial files and state remain after interruption so rerunning resumes the transfer. The relay needs enough local disk for one file at a time, plus any incomplete file being resumed. Progress reports the combined download and upload work.
+
+The nested profile supports one enabled deployment. Set `source.kind` to `remote` with `source.server` and `source.path`, or `this_machine` with a local `source.path`. The `destination` block describes the remote target. Password values stay in the ignored local profile.
+
 ## License
 
 MPL-2.0
