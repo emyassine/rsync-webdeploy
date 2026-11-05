@@ -185,7 +185,7 @@ run_key_value_profile() {
   local server='' user='' ssh_port='22' source_path='.' dest=''
   local ssh_password='' source_ssh_password='' source_ssh_port='22'
   local line key value line_number=0 remote_source=false source_remote='' source_host=''
-  local relay_dir='' askpass_helper='' askpass_display="${DISPLAY:-yas-webdeploy:0}"
+  local relay_dir='' relay_tmpdir="${TMPDIR:-/tmp}" askpass_helper='' askpass_display="${DISPLAY:-yas-webdeploy:0}"
   local dest_ssh="ssh -p 22" source_ssh='' host=''
 
   fail_profile() { say_error "$*"; return 1; }
@@ -194,25 +194,53 @@ run_key_value_profile() {
     return 1
   fi
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line_number=$((line_number + 1))
-    [[ -z "$line" ]] && continue
-    case "$line" in \#*) continue ;; esac
-    [[ "$line" == *=* ]] || { fail_profile "$CONFIG_FILE:$line_number: expected KEY=value"; return 1; }
-    key=${line%%=*}
-    value=${line#*=}
-    case "$key" in
-      SERVER) server=$value ;;
-      USER) user=$value ;;
-      SSH_PORT) ssh_port=$value ;;
-      SOURCE) source_path=$value ;;
-      DEST) dest=$value ;;
-      SSH_PASSWORD) ssh_password=$value ;;
-      SOURCE_SSH_PORT) source_ssh_port=$value ;;
-      SOURCE_SSH_PASSWORD) source_ssh_password=$value ;;
-      *) fail_profile "$CONFIG_FILE:$line_number: unknown key '$key'"; return 1 ;;
-    esac
-  done < "$CONFIG_FILE"
+  if [[ "${CONFIG_FILE##*.}" == json ]]; then
+    local deployment_count source_kind source_host source_user source_path_json
+    deployment_count=$(jq '[.deployments[] | select(.enabled != false)] | length' "$CONFIG_FILE")
+    [[ "$deployment_count" == 1 ]] || { fail_profile 'Nested JSON profiles currently require exactly one enabled deployment'; return 1; }
+    server=$(jq -r '.destination.server.host // empty' "$CONFIG_FILE")
+    user=$(jq -r '.destination.server.user // empty' "$CONFIG_FILE")
+    ssh_port=$(jq -r '.destination.server.ssh.port // 22' "$CONFIG_FILE")
+    ssh_password=$(jq -r '.destination.server.ssh.password // ""' "$CONFIG_FILE")
+    dest=$(jq -r '.destination.path // empty' "$CONFIG_FILE")
+    source_kind=$(jq -r '.source.kind // empty' "$CONFIG_FILE")
+    source_path_json=$(jq -r '.source.path // empty' "$CONFIG_FILE")
+    source_ssh_port=$(jq -r '.source.server.ssh.port // 22' "$CONFIG_FILE")
+    source_ssh_password=$(jq -r '.source.server.ssh.password // ""' "$CONFIG_FILE")
+    relay_tmpdir=$(jq -r '.this_machine.temporary_directory // "system-default"' "$CONFIG_FILE")
+    [[ "$relay_tmpdir" == system-default ]] && relay_tmpdir="${TMPDIR:-/tmp}"
+    if [[ "$source_kind" == remote ]]; then
+      source_host=$(jq -r '.source.server.host // empty' "$CONFIG_FILE")
+      source_user=$(jq -r '.source.server.user // empty' "$CONFIG_FILE")
+      [[ -n "$source_host" && -n "$source_user" ]] || { fail_profile 'Remote source needs source.server.host and source.server.user'; return 1; }
+      source_path="$source_user@$source_host:$source_path_json"
+    elif [[ "$source_kind" == this_machine ]]; then
+      source_path="$source_path_json"
+    else
+      fail_profile 'source.kind must be remote or this_machine'
+      return 1
+    fi
+  else
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line_number=$((line_number + 1))
+      [[ -z "$line" ]] && continue
+      case "$line" in \#*) continue ;; esac
+      [[ "$line" == *=* ]] || { fail_profile "$CONFIG_FILE:$line_number: expected KEY=value"; return 1; }
+      key=${line%%=*}
+      value=${line#*=}
+      case "$key" in
+        SERVER) server=$value ;;
+        USER) user=$value ;;
+        SSH_PORT) ssh_port=$value ;;
+        SOURCE) source_path=$value ;;
+        DEST) dest=$value ;;
+        SSH_PASSWORD) ssh_password=$value ;;
+        SOURCE_SSH_PORT) source_ssh_port=$value ;;
+        SOURCE_SSH_PASSWORD) source_ssh_password=$value ;;
+        *) fail_profile "$CONFIG_FILE:$line_number: unknown key '$key'"; return 1 ;;
+      esac
+    done < "$CONFIG_FILE"
+  fi
 
   [[ -n "$server" && -n "$user" ]] || { fail_profile 'SERVER and USER are required'; return 1; }
   [[ "$ssh_port" =~ ^[0-9]+$ ]] && (( ssh_port >= 1 && ssh_port <= 65535 )) || { fail_profile 'SSH_PORT must be from 1 to 65535'; return 1; }
@@ -257,21 +285,29 @@ run_key_value_profile() {
   if [[ "$remote_source" == true ]]; then
     say_info "Remote source: $source_remote"
     say_info 'Relay: remote source -> this machine -> destination'
-    relay_dir=$(mktemp -d "${TMPDIR:-/tmp}/yas-webdeploy-relay.XXXXXX") || { fail_profile 'Could not create local relay directory'; return 1; }
+    relay_dir=$(mktemp -d "${relay_tmpdir%/}/yas-webdeploy-relay.XXXXXX") || { fail_profile 'Could not create local relay directory'; return 1; }
     say_step 'Downloading source to temporary local relay'
     if [[ -n "$source_ssh_password" ]]; then
-      YAS_WEBDEPLOY_ASKPASS_PASSWORD="$source_ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" rsync -az --human-readable --progress --timeout=30 -e "$source_ssh" "$source_remote" "$relay_dir/"
+      YAS_WEBDEPLOY_ASKPASS_PASSWORD="$source_ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" rsync -az --human-readable --info=progress2 --no-inc-recursive --stats --timeout=30 -e "$source_ssh" "$source_remote" "$relay_dir/"
     else
-      rsync -az --human-readable --progress --timeout=30 -e "$source_ssh" "$source_remote" "$relay_dir/"
+      rsync -az --human-readable --info=progress2 --no-inc-recursive --stats --timeout=30 -e "$source_ssh" "$source_remote" "$relay_dir/"
     fi
     source_path="$relay_dir/"
   fi
 
-  say_step 'Uploading source to destination'
+  printf -v dest_path_q '%q' "$dest"
+  say_step 'Creating destination directory'
   if [[ -n "$ssh_password" ]]; then
-    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" rsync -az --human-readable --progress --timeout=30 -e "$dest_ssh" "$source_path" "$host:$dest/"
+    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" ssh -p "$ssh_port" -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$host" "mkdir -p -- $dest_path_q"
   else
-    rsync -az --human-readable --progress --timeout=30 -e "$dest_ssh" "$source_path" "$host:$dest/"
+    ssh -p "$ssh_port" -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o BatchMode=yes "$host" "mkdir -p -- $dest_path_q"
+  fi
+
+  say_step 'Uploading source to destination (overall progress)'
+  if [[ -n "$ssh_password" ]]; then
+    YAS_WEBDEPLOY_ASKPASS_PASSWORD="$ssh_password" SSH_ASKPASS="$askpass_helper" SSH_ASKPASS_REQUIRE=force DISPLAY="$askpass_display" rsync -az --human-readable --info=progress2 --no-inc-recursive --stats --timeout=30 -e "$dest_ssh" "$source_path" "$host:$dest/"
+  else
+    rsync -az --human-readable --info=progress2 --no-inc-recursive --stats --timeout=30 -e "$dest_ssh" "$source_path" "$host:$dest/"
   fi
   say_success 'Deployment completed'
 }
@@ -287,6 +323,10 @@ ensure_config_file_is_in_gitignore
 [[ ! -f "$CONFIG_FILE" ]] && create_default_config
 
 check_dependencies "${BASE_DEPENDENCIES[@]}"
+if jq -e '(.this_machine | type == "object") and (.source | type == "object") and (.destination | type == "object") and (.deployments | type == "array")' "$CONFIG_FILE" >/dev/null; then
+  run_key_value_profile
+  exit $?
+fi
 jq -e 'type == "object" and (.deploys | type == "object")' "$CONFIG_FILE" >/dev/null || {
   say_error "Invalid JSON config or missing deploys object: $CONFIG_FILE"
   exit 1
