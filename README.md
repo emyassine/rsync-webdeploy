@@ -58,3 +58,25 @@ SSH keys are recommended. Password fields are ignored unless `unsafe_mode` is en
 MPL-2.0
 
 **El Moumen Yassine**
+
+## Lite mode (no `jq`)
+
+Use `yas-webdeploy-lite` for a single SSH/rsync deployment with no JSON parser or other runtime utilities. It reads a plain text `KEY=value` profile and does not execute or source that file. Bash, `rsync`, and `ssh` are the only runtime requirements.
+
+Earth & Sky example profile: [`earth_and_sky-web-sync.conf`](earth_and_sky-web-sync.conf). Copy it into the directory you want to deploy, or download it there from this repository. Example contents:
+
+```ini
+SERVER=145.223.39.21
+USER=u320478370
+SSH_PORT=65002
+SOURCE=.
+DEST=/home/u320478370/domains/earthandskycorp.com/public_html
+```
+
+Run it from the project directory:
+
+```sh
+yas-webdeploy-lite earth_and_sky-web-sync.conf
+```
+
+The source path is relative to the profile file. Lite mode excludes `.git`, `.env`, and `.env.*`. It does not delete remote files that are absent locally.

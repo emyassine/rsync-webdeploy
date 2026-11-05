@@ -5,6 +5,7 @@ set -eu
 RAW_BASE='https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main'
 INSTALL_DIR="${YAS_WEBDEPLOY_INSTALL_DIR:-$HOME/.local/bin}"
 DEST="$INSTALL_DIR/yas-webdeploy"
+LITE_DEST="$INSTALL_DIR/yas-webdeploy-lite"
 say() { printf '%s\n' "yas-webdeploy installer: $*"; }
 fail() { say "Error: $*" >&2; exit 1; }
 
@@ -22,6 +23,17 @@ fi
 [ -s "$tmp_file" ] || fail 'downloaded command is empty'
 install -m 0755 "$tmp_file" "$DEST" || fail "could not install to $DEST"
 say "Installed $DEST"
+
+lite_tmp=$(mktemp "${TMPDIR:-/tmp}/yas-webdeploy-lite.XXXXXX") || fail 'could not create a temporary file for the lite command'
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$RAW_BASE/yas-webdeploy-lite" -o "$lite_tmp" || fail 'lite command download failed'
+else
+    wget -q "$RAW_BASE/yas-webdeploy-lite" -O "$lite_tmp" || fail 'lite command download failed'
+fi
+[ -s "$lite_tmp" ] || fail 'downloaded lite command is empty'
+install -m 0755 "$lite_tmp" "$LITE_DEST" || fail "could not install to $LITE_DEST"
+rm -f "$lite_tmp"
+say "Installed $LITE_DEST"
 
 add_path_setup() {
     target=$1
@@ -54,4 +66,5 @@ case "$shell_name" in
         ;;
 esac
 say "Open a new terminal or run: $reload_hint"
-say 'Then run: yas-webdeploy [config.json]'
+say 'Run JSON profiles with: yas-webdeploy [config.json]'
+say 'Run simple KEY=value profiles with: yas-webdeploy-lite [config.conf]'

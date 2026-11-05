@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Minimal SSH/rsync web deployment. Config is plain KEY=value text, never sourced.
+set -euo pipefail
+
+usage() {
+  printf 'Usage: yas-webdeploy-lite [config.conf]\n'
+  printf 'Deploys the current project profile with rsync over SSH.\n'
+}
+fail() { printf 'yas-webdeploy-lite: %s\n' "$*" >&2; exit 1; }
+
+if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then usage; exit 0; fi
+if (( $# > 1 )); then usage >&2; exit 2; fi
+
+config_file="${1:-$PWD/webdeploy.conf}"
+if [[ "$config_file" != /* ]]; then config_file="$PWD/$config_file"; fi
+[[ -f "$config_file" && -r "$config_file" ]] || fail "config file not found or unreadable: $config_file"
+config_dir="${config_file%/*}"
+config_dir="$(cd -- "$config_dir" && pwd -P)"
+
+server=''
+user=''
+ssh_port='22'
+source_path='.'
+dest=''
+line_number=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line_number=$((line_number + 1))
+  [[ -z "$line" ]] && continue
+  case "$line" in \#*) continue ;; esac
+  [[ "$line" == *=* ]] || fail "$config_file:$line_number: expected KEY=value"
+  key=${line%%=*}
+  value=${line#*=}
+  case "$key" in
+    SERVER) server=$value ;;
+    USER) user=$value ;;
+    SSH_PORT) ssh_port=$value ;;
+    SOURCE) source_path=$value ;;
+    DEST) dest=$value ;;
+    *) fail "$config_file:$line_number: unknown key '$key'" ;;
+  esac
+done < "$config_file"
+
+[[ -n "$server" ]] || fail 'SERVER is required'
+[[ -n "$user" ]] || fail 'USER is required'
+[[ "$ssh_port" =~ ^[0-9]+$ ]] && (( ssh_port >= 1 && ssh_port <= 65535 )) || fail 'SSH_PORT must be an integer from 1 to 65535'
+[[ -n "$source_path" ]] || fail 'SOURCE cannot be empty'
+[[ -n "$dest" && "$dest" == /* ]] || fail 'DEST must be an absolute remote path'
+
+if [[ "$source_path" == /* ]]; then
+  source_dir=$source_path
+else
+  source_dir="$config_dir/$source_path"
+fi
+[[ -d "$source_dir" ]] || fail "source directory not found: $source_dir"
+command -v rsync >/dev/null 2>&1 || fail 'rsync is required on this machine'
+command -v ssh >/dev/null 2>&1 || fail 'ssh is required on this machine'
+
+host="$user@$server"
+printf 'Source:      %s\n' "$source_dir"
+printf 'Destination: %s:%s\n' "$host" "$dest"
+printf 'SSH port:    %s\n' "$ssh_port"
+printf '\nStarting rsync deployment...\n'
+rsync -az --human-readable --progress \
+  -e "ssh -p $ssh_port" \
+  --exclude='/.git/' \
+  --exclude='/.env' \
+  --exclude='/.env.*' \
+  --exclude="/${config_file##*/}" \
+  "$source_dir/" "$host:$dest/"
+printf '\nDeployment completed.\n'
