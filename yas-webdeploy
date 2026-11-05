@@ -1,4 +1,5 @@
 #!/bin/bash
+YAS_WEBDEPLOY_VERSION='2026.11.05-2'
 #
 # yas-webdeploy
 #
@@ -23,6 +24,11 @@
 #
 
 set -euo pipefail
+
+if [[ "${1:-}" == --version ]]; then
+  printf 'yas-webdeploy %s\n' "$YAS_WEBDEPLOY_VERSION"
+  exit 0
+fi
 
 SYNC_WITHOUT_DELAY=false
 if [[ "${1:-}" == --sync-without-delai ]]; then
@@ -60,11 +66,11 @@ else
   C_RED=''
 fi
 
-say_info() { printf '%s•%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
-say_step() { printf '\n%s▶%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
-say_success() { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+say_info() { printf '%s*%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+say_step() { printf '\n%s>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+say_success() { printf '%sOK%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 say_warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-say_error() { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+say_error() { printf '%sERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
 check_dependencies() {
   local dependency
@@ -785,11 +791,11 @@ check_dependencies "${DEPENDENCIES[@]}"
 
 echo ""
 echo ""
-printf '%s%sWEB SYNC (•) DEPLOY%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+printf '%s%sWEB SYNC (*) DEPLOY%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
 printf '%sFast Private Alternative to Git Push\n' "$C_CYAN"
 printf 'Intelligent sync with gitignore respect, excludes .git,\n'
 printf 'optimized transfers, and interactive deployment%s\n' "$C_RESET"
-printf '%s────────────────────────────────────────%s\n' "$C_BLUE" "$C_RESET"
+printf '%s----------------------------------------%s\n' "$C_BLUE" "$C_RESET"
 say_info "Target: $USER@$SERVER"
 say_info "Method: $METHOD"
 [[ "$METHOD" != ssh ]] || say_info "SSH port: $SSH_PORT"
@@ -817,7 +823,7 @@ while IFS=$'\t' read -r INSTANCE source_input TARGET CONTEXT; do
   if [[ ! -d "$SOURCE" ]]; then say_error "Source directory does not exist: $SOURCE"; exit 1; fi
   SOURCE="$(cd -- "$SOURCE" && pwd)/"
 
-  say_step "$INSTANCE · $CONTEXT"
+  say_step "$INSTANCE - $CONTEXT"
   say_info "Source: ${SOURCE%/}"
   say_info "Destination: $TARGET"
   say_info "Preparing transfer via $METHOD"

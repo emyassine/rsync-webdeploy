@@ -3,25 +3,29 @@
 set -eu
 
 RAW_BASE='https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main'
+EXPECTED_VERSION='2026.11.05-2'
 INSTALL_DIR="${YAS_WEBDEPLOY_INSTALL_DIR:-$HOME/.local/bin}"
 DEST="$INSTALL_DIR/yas-webdeploy"
 say() { printf '%s\n' "yas-webdeploy installer: $*"; }
 fail() { say "Error: $*" >&2; exit 1; }
 
 mkdir -p "$INSTALL_DIR" || fail "could not create $INSTALL_DIR"
-tmp_file=$(mktemp "${TMPDIR:-/tmp}/yas-webdeploy.XXXXXX") || fail 'could not create a temporary file'
-trap 'rm -f "$tmp_file"' EXIT HUP INT TERM
+tmp_file=$(mktemp "$INSTALL_DIR/.yas-webdeploy.XXXXXX") || fail 'could not create a temporary file'
+trap '[ -z "$tmp_file" ] || rm -f "$tmp_file"' EXIT HUP INT TERM
 
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$RAW_BASE/yas-webdeploy" -o "$tmp_file" || fail 'download failed'
+    curl -fsSL "$RAW_BASE/yas-webdeploy?v=$EXPECTED_VERSION" -o "$tmp_file" || fail 'download failed'
 elif command -v wget >/dev/null 2>&1; then
-    wget -q "$RAW_BASE/yas-webdeploy" -O "$tmp_file" || fail 'download failed'
+    wget -q "$RAW_BASE/yas-webdeploy?v=$EXPECTED_VERSION" -O "$tmp_file" || fail 'download failed'
 else
     fail 'curl or wget is required'
 fi
 [ -s "$tmp_file" ] || fail 'downloaded command is empty'
-install -m 0755 "$tmp_file" "$DEST" || fail "could not install to $DEST"
-say "Installed $DEST"
+grep -Fqx "YAS_WEBDEPLOY_VERSION='$EXPECTED_VERSION'" "$tmp_file" || fail 'downloaded command version does not match installer'
+chmod 0755 "$tmp_file" || fail 'could not make downloaded command executable'
+mv -f "$tmp_file" "$DEST" || fail "could not replace $DEST"
+tmp_file=''
+say "Installed $DEST (version $EXPECTED_VERSION)"
 
 if [ -e "$INSTALL_DIR/yas-webdeploy-lite" ]; then
     unlink "$INSTALL_DIR/yas-webdeploy-lite"
@@ -35,6 +39,9 @@ add_path_setup() {
     if ! grep -Fq "$path_line" "$target"; then
         printf '\n# Added by yas-webdeploy installer\n%s\n' "$path_line" >> "$target" || fail "could not update $target"
         say "Added ~/.local/bin to PATH in $target"
+    fi
+    if ! grep -Fqx 'hash -r 2>/dev/null || true' "$target"; then
+        printf '%s\n' 'hash -r 2>/dev/null || true' >> "$target" || fail "could not update $target"
     fi
 }
 
