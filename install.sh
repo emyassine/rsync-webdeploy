@@ -3,7 +3,7 @@
 set -eu
 
 RAW_BASE='https://raw.githubusercontent.com/emyassine/rsync-webdeploy/main'
-EXPECTED_VERSION='2026.11.05-4'
+EXPECTED_VERSION='2026.11.05-5'
 INSTALL_DIR="${YAS_WEBDEPLOY_INSTALL_DIR:-$HOME/.local/bin}"
 DEST="$INSTALL_DIR/yas-webdeploy"
 say() { printf '%s\n' "yas-webdeploy installer: $*"; }

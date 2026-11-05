@@ -1,5 +1,5 @@
 #!/bin/bash
-YAS_WEBDEPLOY_VERSION='2026.11.05-4'
+YAS_WEBDEPLOY_VERSION='2026.11.05-5'
 #
 # yas-webdeploy
 #
@@ -329,10 +329,11 @@ run_sync_without_delay() {
   local source_kind direct_command source_remote_q dest_path_q source_path_q remote_parent_q remote_command
   local file_size file_mtime relative_path file_id marker signature local_file parent_path
   local total_files=0 total_bytes=0 fetched_bytes=0 sent_bytes=0 fetched_files=0 sent_files=0
-  local current_index=0 inventory_path source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
+  local current_index=0 inventory_index inventory_path source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
   local fetch_batch_bytes=0 remote_mkdir_command parent_dir candidate_dir known
   local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=()
   local -a dest_directories=()
+  local -a inventory_sizes=() inventory_mtimes=() inventory_paths=()
 
   ND_SYNC_START_SECONDS=$SECONDS
 
@@ -484,10 +485,20 @@ run_sync_without_delay() {
     say_error 'Could not list source files'
     return "$inventory_status"
   fi
-  while IFS= read -r -d '' file_size && IFS= read -r -d '' file_mtime && IFS= read -r -d '' relative_path; do
-    [[ "$file_size" =~ ^[0-9]+$ && -n "$file_mtime" && -n "$relative_path" ]] || { say_error 'Invalid NUL-delimited source inventory record'; return 1; }
+  while IFS= read -r -d '' file_size; do
+    if ! IFS= read -r -d '' file_mtime || ! IFS= read -r -d '' relative_path; then
+      say_error "Source inventory ended in the middle of entry $((total_files + 1))"
+      return 1
+    fi
+    if [[ ! "$file_size" =~ ^[0-9]+$ || -z "$file_mtime" || -z "$relative_path" ]]; then
+      say_error "Invalid source inventory entry $((total_files + 1)); size, timestamp, or path field is empty or malformed"
+      return 1
+    fi
     total_files=$((total_files + 1))
     total_bytes=$((total_bytes + file_size))
+    inventory_sizes+=("$file_size")
+    inventory_mtimes+=("$file_mtime")
+    inventory_paths+=("$relative_path")
   done < "$inventory_path"
   (( total_files > 0 )) || { say_error 'The source directory contains no regular files'; return 1; }
   ND_PROGRESS_TOTAL=$((total_bytes * 2))
@@ -600,8 +611,10 @@ run_sync_without_delay() {
     batch_start_index=0
   }
 
-  while IFS= read -r -d '' file_size && IFS= read -r -d '' file_mtime && IFS= read -r -d '' relative_path; do
-    [[ "$file_size" =~ ^[0-9]+$ && -n "$file_mtime" && -n "$relative_path" ]] || { say_error 'Invalid NUL-delimited source inventory record'; return 1; }
+  for ((inventory_index = 0; inventory_index < total_files; inventory_index++)); do
+    file_size=${inventory_sizes[inventory_index]}
+    file_mtime=${inventory_mtimes[inventory_index]}
+    relative_path=${inventory_paths[inventory_index]}
     current_index=$((current_index + 1))
     file_id=$(printf '%s' "$relative_path" | cksum)
     file_id=${file_id%% *}
@@ -635,7 +648,7 @@ run_sync_without_delay() {
     if (( ${#batch_paths[@]} >= 32 || batch_bytes >= 8388608 )); then
       flush_batch
     fi
-  done < "$inventory_path"
+  done
   flush_batch
 
   [[ -t 1 ]] && printf '\n'
