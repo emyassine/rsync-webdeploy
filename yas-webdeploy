@@ -1,5 +1,5 @@
 #!/bin/bash
-YAS_WEBDEPLOY_VERSION='2026.11.05-7'
+YAS_WEBDEPLOY_VERSION='2026.11.05-8'
 #
 # yas-webdeploy
 #
@@ -348,7 +348,7 @@ run_sync_without_delay() {
   local total_files=0 total_bytes=0 fetched_bytes=0 sent_bytes=0 fetched_files=0 sent_files=0
   local current_index=0 inventory_index inventory_path source_find_command batch_number=0 batch_bytes=0 batch_start_index=0
   local fetch_batch_bytes=0 remote_mkdir_command parent_dir candidate_dir known
-  local direct_sftp_available=false direct_sftp_pull=false direct_sftp_log direct_sftp_output direct_sftp_probe direct_sftp_probe_batch direct_sftp_command direct_sftp_batch direct_sftp_quoted_endpoint direct_sftp_quoted_source direct_sftp_quoted_local direct_sftp_quoted_target direct_sftp_target direct_sftp_stage direct_sftp_finalize direct_sftp_reason direct_sftp_choice sftp_paths_supported=true
+  local direct_sftp_available=false direct_sftp_pull=false direct_sftp_log direct_sftp_output direct_sftp_probe direct_sftp_probe_batch direct_sftp_command direct_sftp_batch direct_sftp_quoted_endpoint direct_sftp_quoted_source direct_sftp_quoted_local direct_sftp_quoted_target direct_sftp_target direct_sftp_stage direct_sftp_finalize direct_sftp_reason direct_sftp_choice='' sftp_paths_supported=true
   local file_type link_target destination_file destination_parent destination_stage remote_source_file quoted_stage quoted_final quoted_target stage_hash
   local -a batch_paths=() batch_sizes=() batch_mtimes=() batch_ids=() batch_needs_fetch=() batch_types=() batch_link_targets=()
   local -a dest_directories=()
@@ -474,7 +474,7 @@ run_sync_without_delay() {
     direct_sftp_probe_batch="$relay_state/direct-sftp-probe.batch"
     direct_sftp_quoted_source=$(sftp_quote_path "$source_root") || { say_error 'SFTP cannot represent a source path with line breaks'; return 1; }
     printf 'cd %s\n' "$direct_sftp_quoted_source" > "$direct_sftp_probe_batch"
-    direct_sftp_probe="command -v sftp >/dev/null 2>&1 || { echo YAS_DEST_SFTP_MISSING; exit 30; }; sftp -q -b - -P $source_ssh_port -oBatchMode=yes -oConnectTimeout=8 $direct_probe_source_q"
+    direct_sftp_probe="command -v sftp >/dev/null 2>&1 || { echo YAS_DEST_SFTP_MISSING; exit 30; }; sftp -b - -P $source_ssh_port -oBatchMode=yes -oConnectTimeout=8 $direct_probe_source_q"
     operation_start 'Probe destination-to-source SFTP'
     if ssh -S "$ND_DEST_SOCKET" -p "$ssh_port" "$host" "$direct_sftp_probe" < "$direct_sftp_probe_batch" > "$direct_sftp_log" 2>&1; then
       direct_sftp_available=true
@@ -491,10 +491,31 @@ run_sync_without_delay() {
         *'Permission denied'*) direct_sftp_reason='the destination has no SSH key authorized on the source; the source password configured on this machine is not forwarded to the destination' ;;
         *'Connection timed out'*|*'Operation timed out'*) direct_sftp_reason='the destination cannot reach the source SSH port (routing or firewall timeout)' ;;
         *'Connection refused'*) direct_sftp_reason='the source refused SSH connections on the configured port' ;;
+        *'Connection closed'*) direct_sftp_reason='the source closed the SFTP session; its SFTP subsystem may be disabled or rejecting the session' ;;
+        *'subsystem request failed'*) direct_sftp_reason='the source SSH server does not provide the SFTP subsystem' ;;
         *'Could not resolve hostname'*|*'Name or service not known'*) direct_sftp_reason='the destination could not resolve the source hostname' ;;
       esac
       say_warn "Direct rsync pull failed; direct SFTP is unavailable: $direct_sftp_reason"
       say_info "SFTP diagnostic: $direct_sftp_log (exit $sftp_probe_status)"
+      [[ -z "$direct_sftp_output" ]] || say_info "SFTP server response: ${direct_sftp_output%%$'\n'*}"
+      say_info 'Choices: 1) relay through this machine now; 2) stop and fix destination-to-source SFTP access; 3) cancel.'
+      if [[ -t 0 ]]; then
+        printf 'Choose [1/2/3] (default 1): '
+        IFS= read -r direct_sftp_choice || direct_sftp_choice=1
+        direct_sftp_choice=${direct_sftp_choice:-1}
+      else
+        direct_sftp_choice=1
+      fi
+      case "$direct_sftp_choice" in
+        1) say_info 'Continuing with the resumable rsync relay' ;;
+        2)
+          say_info 'On the destination, accept the verified source host key, authorize the destination SSH public key on the source, and confirm the source allows SFTP.'
+          say_info 'Test from the destination: sftp -P <source-port> <source-user>@<source-host>'
+          return 2
+          ;;
+        3) say_info 'Cancelled before transferring files'; return 1 ;;
+        *) say_error 'Choose 1, 2, or 3'; return 2 ;;
+      esac
     fi
     say_info "Rsync diagnostic: $direct_probe_log"
   fi
@@ -559,24 +580,26 @@ run_sync_without_delay() {
     esac
   else
     ND_PROGRESS_TOTAL=$((total_bytes * 2))
-    say_info 'Choices: 1) relay through this machine with rsync; 2) stop and configure destination-to-source SFTP access; 3) cancel.'
-    if [[ -t 0 ]]; then
-      printf 'Choose [1/2/3] (default 1): '
-      IFS= read -r direct_sftp_choice || direct_sftp_choice=1
-      direct_sftp_choice=${direct_sftp_choice:-1}
-    else
-      direct_sftp_choice=1
+    if [[ "$direct_sftp_choice" != 1 ]]; then
+      say_info 'Choices: 1) relay through this machine with rsync; 2) stop and configure destination-to-source SFTP access; 3) cancel.'
+      if [[ -t 0 ]]; then
+        printf 'Choose [1/2/3] (default 1): '
+        IFS= read -r direct_sftp_choice || direct_sftp_choice=1
+        direct_sftp_choice=${direct_sftp_choice:-1}
+      else
+        direct_sftp_choice=1
+      fi
+      case "$direct_sftp_choice" in
+        1) say_info 'Continuing with the resumable rsync relay' ;;
+        2)
+          say_info 'On the destination, verify the source host key, authorize the destination SSH public key on the source, and confirm an SFTP client is installed.'
+          say_info 'Then test: sftp -P <source-port> <source-user>@<source-host>'
+          return 2
+          ;;
+        3) say_info 'Cancelled before transferring files'; return 1 ;;
+        *) say_error 'Choose 1, 2, or 3'; return 2 ;;
+      esac
     fi
-    case "$direct_sftp_choice" in
-      1) say_info 'Continuing with the resumable rsync relay' ;;
-      2)
-        say_info 'On the destination, verify the source host key, authorize the destination SSH public key on the source, and confirm an SFTP client is installed.'
-        say_info 'Then test: sftp -P <source-port> <source-user>@<source-host>'
-        return 2
-        ;;
-      3) say_info 'Cancelled before transferring files'; return 1 ;;
-      *) say_error 'Choose 1, 2, or 3'; return 2 ;;
-    esac
   fi
   if [[ "$direct_sftp_pull" != true ]]; then check_dependencies rsync || return 1; fi
   say_info "Queued $total_files files ($total_bytes bytes); small files will be sent in short batches"
