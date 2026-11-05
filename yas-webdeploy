@@ -1,5 +1,5 @@
 #!/bin/bash
-YAS_WEBDEPLOY_VERSION='2026.11.05-6'
+YAS_WEBDEPLOY_VERSION='2026.11.05-7'
 #
 # yas-webdeploy
 #
@@ -430,7 +430,7 @@ run_sync_without_delay() {
   # First try a destination-side pull. It needs destination-to-source SSH key access.
   printf -v source_remote_q '%q' "$source_remote"
   printf -v dest_path_q '%q' "$dest/"
-  local direct_probe direct_source_ssh direct_probe_status direct_probe_output direct_probe_log direct_reason direct_choice direct_transfer_status
+  local direct_probe direct_source_ssh direct_probe_status direct_probe_output='' direct_probe_log direct_reason='' direct_choice='' direct_transfer_status
   printf -v direct_probe_source_q '%q' "$source_endpoint"
   direct_source_ssh="ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6"
   direct_probe="command -v rsync >/dev/null 2>&1 || { echo YAS_DEST_RSYNC_MISSING; exit 20; }; ssh -p $source_ssh_port -o BatchMode=yes -o ConnectTimeout=6 $direct_probe_source_q 'command -v rsync >/dev/null 2>&1 || { echo YAS_SOURCE_RSYNC_MISSING; exit 21; }'"
