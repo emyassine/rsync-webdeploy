@@ -60,7 +60,7 @@ Run a nested JSON profile with:
 yas-webdeploy --sync-without-delai web-sync.config.json
 ```
 
-It checks SSH access to both endpoints before transferring and keeps those SSH control connections open. If the destination can SSH to the source with a key, it pulls directly. Otherwise it relays one file at a time through this machine, tracking fetched and sent files under `~/.local/state/yas-webdeploy/`. Partial files and state remain after interruption so rerunning resumes the transfer. The relay needs enough local disk for one file at a time, plus any incomplete file being resumed. Progress reports the combined download and upload work.
+It checks SSH access to both endpoints before transferring and keeps those SSH control connections open. If the destination can SSH to the source with a key, it pulls directly. Otherwise it relays short batches through this machine, tracking fetched and sent files under `~/.local/state/yas-webdeploy/`. Batches contain up to 32 files or about 8 MiB. Partial files and state remain after interruption so rerunning resumes the transfer. The relay needs local disk for the current batch, plus any incomplete batch being resumed. Progress reports the combined download and upload work.
 
 The nested profile supports one enabled deployment. Set `source.kind` to `remote` with `source.server` and `source.path`, or `this_machine` with a local `source.path`. The `destination` block describes the remote target. Password values stay in the ignored local profile.
 
