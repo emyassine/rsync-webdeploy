@@ -1,3 +1,4 @@
 web-sync.config.json
-
+*.json
+*.conf
 --sync-without-delai
